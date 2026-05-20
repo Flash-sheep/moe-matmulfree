@@ -49,6 +49,7 @@ coverage.xml
 # Environments
 .env
 .venv
+/.venv/
 env/
 venv/
 ENV/
@@ -72,3 +73,10 @@ lightning_logs/
 # Triton cache
 ~/.triton/
 
+# Local workspace artifacts
+/.codex
+/checkpoints
+/data
+/outputs
+/logs
+/experiments/sparse_upcycling/tmp/

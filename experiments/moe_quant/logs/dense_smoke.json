@@ -1,0 +1,14 @@
+[
+  {
+    "step": 0,
+    "loss": 5.523530006408691,
+    "lm_loss": 5.523530006408691,
+    "router_aux_loss": null
+  },
+  {
+    "step": 1,
+    "loss": 5.561559200286865,
+    "lm_loss": 5.561559200286865,
+    "router_aux_loss": null
+  }
+]

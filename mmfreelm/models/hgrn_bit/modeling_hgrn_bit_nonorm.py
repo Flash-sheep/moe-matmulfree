@@ -49,6 +49,7 @@ class HGRNBitMLP(nn.Module):
 
         self.gate_proj = BitLinear(self.hidden_size, self.intermediate_size * 2, bias=False)
         self.down_proj = BitLinear(self.intermediate_size, self.hidden_size, bias=False)
+        self.down_proj._is_residual_projection = True
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
@@ -120,6 +121,20 @@ class HGRNBitPreTrainedModel(PreTrainedModel):
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
 
+    def _initialize_missing_keys(self, is_quantized: bool) -> None:
+        for module in self.modules():
+            if getattr(module, "_is_hf_initialized", False):
+                continue
+            direct_params = list(module.parameters(recurse=False))
+            direct_buffers = [buffer for buffer in module.buffers(recurse=False) if buffer is not None]
+            if not direct_params and not direct_buffers:
+                continue
+            if all(getattr(param, "_is_hf_initialized", False) for param in direct_params) and all(
+                getattr(buffer, "_is_hf_initialized", False) for buffer in direct_buffers
+            ):
+                module._is_hf_initialized = True
+        super()._initialize_missing_keys(is_quantized)
+
     def _init_weights(
         self,
         module: nn.Module,
@@ -137,21 +152,15 @@ class HGRNBitPreTrainedModel(PreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
 
-        if rescale_prenorm_residual:
+        if rescale_prenorm_residual and getattr(module, "_is_residual_projection", False):
             # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
             #   > A modified initialization which accounts for the accumulation on the residual path with model depth. Scale
             #   > the weights of residual layers at initialization by a factor of 1/√N where N is the # of residual layers.
             #   >   -- GPT-2 :: https://openai.com/blog/better-language-models/
             #
             # Reference (Megatron-LM): https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/model/gpt_model.py
-            for name, p in module.named_parameters():
-                if name in ["o_proj.weight", "down_proj.weight"]:
-                    # Special Scaled Initialization --> There are 2 Layer Norms per Transformer Block
-                    # Following Pytorch init, except scale by 1/sqrt(2 * n_layer)
-                    # We need to reinit p since this code could be called multiple times
-                    # Having just p *= scale would repeatedly scale it down
-                    with torch.no_grad():
-                        p /= math.sqrt(num_residuals_per_layer * self.config.num_hidden_layers)
+            with torch.no_grad():
+                module.weight /= math.sqrt(num_residuals_per_layer * self.config.num_hidden_layers)
 
 
 class HGRNBitModel(HGRNBitPreTrainedModel):
@@ -277,7 +286,7 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
 
 
 class HGRNBitForCausalLM(HGRNBitPreTrainedModel):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = None
 
     def __init__(self, config):
         super().__init__(config)

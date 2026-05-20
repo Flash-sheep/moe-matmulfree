@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MatmulFreeLLM MoE Quantization Validation Guide</title>
+  <style>
+    :root {
+      --bg: #f4f1ea;
+      --panel: #fffdf8;
+      --ink: #1f2937;
+      --muted: #5b6470;
+      --accent: #0f766e;
+      --accent-soft: #dff4ee;
+      --line: #d8d2c8;
+      --warn: #92400e;
+      --warn-soft: #fff3d6;
+      --code: #f3f4f6;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      background: linear-gradient(180deg, #efe9dc 0%, var(--bg) 100%);
+      color: var(--ink);
+      line-height: 1.65;
+    }
+
+    .page {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 40px 24px 72px;
+    }
+
+    .hero,
+    .section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      box-shadow: 0 10px 28px rgba(31, 41, 55, 0.06);
+    }
+
+    .hero {
+      padding: 32px;
+      margin-bottom: 24px;
+    }
+
+    .eyebrow {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    h1, h2, h3 {
+      margin: 0 0 12px;
+      line-height: 1.25;
+    }
+
+    h1 {
+      margin-top: 16px;
+      font-size: 34px;
+    }
+
+    h2 {
+      font-size: 24px;
+      padding: 24px 24px 0;
+    }
+
+    h3 {
+      font-size: 18px;
+    }
+
+    p, li {
+      color: var(--ink);
+      font-size: 16px;
+    }
+
+    .subtle {
+      color: var(--muted);
+    }
+
+    .section {
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+
+    .section-body {
+      padding: 0 24px 24px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+      margin-top: 20px;
+    }
+
+    .card {
+      background: #fcfaf4;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+
+    .card strong {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--accent);
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin-top: 16px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 860px;
+    }
+
+    th, td {
+      border: 1px solid var(--line);
+      padding: 12px 14px;
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: #f7f4ec;
+      font-weight: 700;
+    }
+
+    ul, ol {
+      margin: 10px 0 0 22px;
+      padding: 0;
+    }
+
+    code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      background: var(--code);
+      padding: 2px 6px;
+      border-radius: 5px;
+      font-size: 0.95em;
+    }
+
+    .note {
+      margin-top: 16px;
+      padding: 14px 16px;
+      border-left: 4px solid var(--warn);
+      background: var(--warn-soft);
+      color: #6b4d13;
+      border-radius: 6px;
+    }
+
+    .footer {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    @media (max-width: 720px) {
+      .page {
+        padding: 20px 14px 40px;
+      }
+
+      .hero,
+      .section-body,
+      h2 {
+        padding-left: 16px;
+        padding-right: 16px;
+      }
+
+      h1 {
+        font-size: 28px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <span class="eyebrow">Project Guide</span>
+      <h1>MatmulFreeLLM 量化方案在 MoE 架构下的验证指导</h1>
+      <p class="subtle">
+        本文件用于指导当前项目的实验设计、阶段验收、失败迭代和最终汇报。
+        后续在本对话内继续推进该项目时，应优先读取本文件并以此为默认基线。
+      </p>
+    </section>
+
+    <section class="section">
+      <h2>1. 项目目标</h2>
+      <div class="section-body">
+        <p>
+          验证 <code>MatmulFreeLLM</code> 当前采用的量化方案，即
+          <code>activation per-token int8 fake quant + ternary weight {-1,0,1} + STE</code>，
+          能否在 <code>MoE</code> 架构中有效工作，并在可接受范围内不带来明显精度损失。
+        </p>
+        <div class="grid">
+          <div class="card">
+            <strong>一级目标</strong>
+            仅量化 <code>expert MLP</code>，验证主任务精度是否保持稳定。
+          </div>
+          <div class="card">
+            <strong>二级目标</strong>
+            在一级目标成立后，再探索 <code>lm_head</code> 或 shared FFN 的进一步量化。
+          </div>
+          <div class="card">
+            <strong>非一期目标</strong>
+            不把 router 三值化、attention 全路径三值化作为第一阶段硬目标。
+          </div>
+        </div>
+        <div class="note">
+          推荐先将“可接受范围”固定为：相对 <code>FP/BF16 MoE baseline</code>，
+          <code>validation perplexity</code> 劣化不超过 <code>3%~5%</code>，
+          且无明显 expert collapse、无训练发散。
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>2. 验收总标准</h2>
+      <div class="section-body">
+        <ul>
+          <li>主指标：相对 <code>FP/BF16 MoE baseline</code>，验证集 <code>ppl</code> 劣化不超过 <code>3%</code>；若存在下游任务，绝对分数下降不超过 <code>1</code> 个点或相对下降不超过 <code>2%</code>。</li>
+          <li>稳定性：训练过程中无 <code>NaN</code>、<code>Inf</code>、持续性 loss 发散。</li>
+          <li>路由质量：无明显 <code>expert collapse</code>，expert token 分布不过度偏斜。</li>
+          <li>收敛效率：达到目标指标的训练步数不超过 baseline 的 <code>1.3x</code>。</li>
+          <li>结论质量：至少在多个随机种子下可重复，不能只依赖单次幸运结果。</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>3. 项目执行流程</h2>
+      <div class="section-body">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>阶段</th>
+                <th>阶段目标</th>
+                <th>执行内容</th>
+                <th>验收标准</th>
+                <th>不通过时的自我迭代方案</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Phase 0</td>
+                <td>锁定实验基线</td>
+                <td>确定数据集、模型规模、专家数、<code>top-k</code>、训练步数、优化器、学习率、日志格式、随机种子。</td>
+                <td>后续实验共享统一训练配方，避免基线漂移。</td>
+                <td>如配置尚未稳定，暂停量化验证，先只做基线训练收敛确认。</td>
+              </tr>
+              <tr>
+                <td>Phase 1</td>
+                <td>建立非量化 Dense/MoE 基线</td>
+                <td>运行 <code>Dense FP/BF16</code> 与 <code>MoE FP/BF16</code> 对照实验。</td>
+                <td><code>MoE FP/BF16</code> 能稳定训练，且指标合理，不出现 collapse。</td>
+                <td>优先调 router、<code>capacity factor</code>、<code>load balance loss</code>、<code>top-k</code>，不进入量化阶段。</td>
+              </tr>
+              <tr>
+                <td>Phase 2</td>
+                <td>最小量化可行性验证</td>
+                <td>仅量化 <code>expert MLP</code> 中的线性层；router、attention、embedding、<code>lm_head</code> 保持浮点。</td>
+                <td>相对 <code>MoE FP/BF16</code>，主指标退化在阈值内，训练稳定。</td>
+                <td>若失败，先尝试 warm-start、降低学习率、延长 warmup、增强 load balance loss、切换 <code>top-1/top-2</code>。</td>
+              </tr>
+              <tr>
+                <td>Phase 3</td>
+                <td>收敛与鲁棒性复核</td>
+                <td>多随机种子、多训练长度、多评估点复现。</td>
+                <td>结论可复现，量化版本不是偶然成功或偶然失败。</td>
+                <td>若 seed 波动大，增加训练步数，记录 router entropy、expert 负载、梯度范数，必要时采用渐进量化。</td>
+              </tr>
+              <tr>
+                <td>Phase 4</td>
+                <td>扩大量化边界</td>
+                <td>在 Phase 2 成功后，逐步试验 shared FFN、<code>lm_head</code> 等模块。</td>
+                <td>每次扩展后仍满足主指标阈值，且训练稳定。</td>
+                <td>某一步失败即回退，记录失败边界，不继续无序叠加量化范围。</td>
+              </tr>
+              <tr>
+                <td>Phase 5</td>
+                <td>泛化性验证</td>
+                <td>更换不同数据切片、上下文长度、专家容量或路由配置复核结论。</td>
+                <td>结论不依赖单一数据或单一超参点。</td>
+                <td>若只在局部配置有效，则明确收缩结论范围，禁止过度泛化。</td>
+              </tr>
+              <tr>
+                <td>Phase 6</td>
+                <td>形成最终结论</td>
+                <td>汇总通过与失败方案、成功边界、失败原因、推荐配置。</td>
+                <td>能够明确回答“在哪个量化程度下满足项目目标”。</td>
+                <td>若全部失败，则输出失败结论和最可能瓶颈，而不是模糊描述。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>4. 推荐实验矩阵</h2>
+      <div class="section-body">
+        <ol>
+          <li><code>Dense FP/BF16 baseline</code></li>
+          <li><code>MoE FP/BF16 baseline</code></li>
+          <li><code>MoE + ternary expert weights + int8 activation fake quant</code></li>
+          <li><code>MoE + ternary experts + warm-start from FP MoE checkpoint</code></li>
+          <li><code>MoE + ternary experts + top-1 vs top-2 routing</code></li>
+          <li><code>MoE + ternary experts + different load balance coefficients</code></li>
+          <li><code>MoE + ternary experts + lm_head ternary</code></li>
+          <li><code>MoE + ternary router</code>，仅作为后置高风险探索项</li>
+        </ol>
+        <div class="note">
+          默认优先级：先验证 <code>expert-only quantization</code>，后验证更激进量化，不要一开始就追求全模型三值化。
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>5. 每阶段必须记录的指标</h2>
+      <div class="section-body">
+        <ul>
+          <li><code>validation loss / perplexity</code></li>
+          <li>下游任务主指标，如 <code>accuracy</code>、<code>F1</code>、<code>BLEU</code></li>
+          <li><code>load balance loss</code></li>
+          <li>每个 expert 的 token 占比与长期利用率</li>
+          <li>router entropy、top-k 分布</li>
+          <li>梯度范数、是否出现 <code>NaN/Inf</code></li>
+          <li>达到目标验证指标所需训练步数</li>
+          <li>显存占用与 <code>tokens/s</code></li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>6. 失败时的优先排查顺序</h2>
+      <div class="section-body">
+        <ol>
+          <li>先判断问题是否来自 <code>MoE</code> 本身，而不是量化。</li>
+          <li>再判断问题是否来自 router，而不是 expert 三值化。</li>
+          <li>再检查训练配方是否不适合量化：学习率过大、warmup 太短、aux loss 太弱。</li>
+          <li>最后才下结论说“三值量化在该位置不可用”。</li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>7. 最终预期效果</h2>
+      <div class="section-body">
+        <div class="grid">
+          <div class="card">
+            <strong>最现实的成功形态</strong>
+            在 <code>expert MLP</code> 上应用 MatmulFreeLLM 量化方案，router 保持浮点，主指标退化不超过 <code>3%~5%</code>。
+          </div>
+          <div class="card">
+            <strong>加分项</strong>
+            在一级目标成立后，<code>lm_head</code> 或 shared FFN 也可量化，整体仍不显著破坏精度。
+          </div>
+          <div class="card">
+            <strong>暂不作为一期目标</strong>
+            router 三值化、attention 路径全面三值化、运行时专用 ternary kernel 加速。
+          </div>
+        </div>
+        <p>
+          项目最终需要回答的问题应当收敛为一句明确结论：
+          在什么量化程度下，<code>MoE</code> 可以稳定训练并保持可接受精度；哪些模块量化后会显著破坏性能。
+        </p>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>8. 结果汇报模板</h2>
+      <div class="section-body">
+        <h3>8.1 实验设置</h3>
+        <p>说明模型规模、专家数、<code>top-k</code>、训练步数、学习率、量化范围、随机种子、数据配置。</p>
+
+        <h3>8.2 主结果表</h3>
+        <p>并列展示 <code>Dense FP</code>、<code>MoE FP</code>、<code>MoE ternary experts</code>、<code>warm-start</code> 等关键版本。</p>
+
+        <h3>8.3 路由与稳定性分析</h3>
+        <p>展示 expert token 分布、load balance 曲线、collapse 风险、梯度异常记录。</p>
+
+        <h3>8.4 最终结论</h3>
+        <p>建议固定使用如下结论模板：</p>
+        <p>
+          <code>
+            结论：在 [quant scope] 下，相对 FP MoE baseline，验证集 [metric] 退化 [x%]，
+            训练稳定/不稳定，满足/不满足项目目标。主要风险集中在 [router / load balance / convergence]。
+            推荐下一步推进 [expert-only / expert+lm_head]，不推荐当前阶段推进 [router quantization / full-model ternary]。
+          </code>
+        </p>
+      </div>
+    </section>
+
+    <p class="footer">
+      File intent: this guide should be re-read in later turns of the current conversation before continuing MoE quantization work in this repository.
+    </p>
+  </main>
+</body>
+</html>

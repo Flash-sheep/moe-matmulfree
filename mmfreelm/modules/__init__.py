@@ -6,10 +6,12 @@ from mmfreelm.modules.fused_cross_entropy import FusedCrossEntropyLoss
 from mmfreelm.modules.fused_norm_gate import FusedRMSNormSwishGate
 from mmfreelm.modules.layernorm import (LayerNorm, LayerNormLinear, RMSNorm,
                                         RMSNormLinear)
+from mmfreelm.modules.moe import ExpertMLP, SparseMoEBlock, TopKRouter
 
 __all__ = [
     'ImplicitLongConvolution', 'LongConvolution', 'ShortConvolution',
     'FusedCrossEntropyLoss',
     'LayerNorm', 'LayerNormLinear', 'RMSNorm', 'RMSNormLinear',
-    'FusedRMSNormSwishGate'
+    'FusedRMSNormSwishGate',
+    'ExpertMLP', 'SparseMoEBlock', 'TopKRouter',
 ]

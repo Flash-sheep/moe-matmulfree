@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -19,12 +20,27 @@ from transformers.utils import logging
 from mmfreelm.layers.hgrn_bit import HGRNBitAttention
 from mmfreelm.models.hgrn_bit.configuration_hgrn_bit import HGRNBitConfig
 from mmfreelm.models.utils import RecurrentCache
-from mmfreelm.modules import FusedCrossEntropyLoss, RMSNorm
-from mmfreelm.modules.activations import swiglu_linear, swiglu
+from mmfreelm.modules import FusedCrossEntropyLoss, RMSNorm, SparseMoEBlock
+from mmfreelm.modules.activations import swiglu
 #from mmfreelm.ops.bitnet import BitLinear_Fuse as BitLinear
 from mmfreelm.ops.fusedbitnet import FusedBitLinear as BitLinear
 
 logger = logging.get_logger(__name__)
+
+
+@dataclass
+class HGRNBitMoEModelOutputWithPast(BaseModelOutputWithPast):
+    router_aux_loss: Optional[torch.FloatTensor] = None
+    router_logits: Optional[Tuple[torch.FloatTensor, ...]] = None
+    router_metrics: Optional[Tuple[Dict[str, torch.Tensor], ...]] = None
+
+
+@dataclass
+class HGRNBitMoECausalLMOutputWithPast(CausalLMOutputWithPast):
+    router_aux_loss: Optional[torch.FloatTensor] = None
+    router_logits: Optional[Tuple[torch.FloatTensor, ...]] = None
+    router_metrics: Optional[Tuple[Dict[str, torch.Tensor], ...]] = None
+    lm_loss: Optional[torch.FloatTensor] = None
 
 
 class HGRNBitMLP(nn.Module):
@@ -51,6 +67,7 @@ class HGRNBitMLP(nn.Module):
 
         self.gate_proj = BitLinear(self.hidden_size, self.intermediate_size * 2, bias=False)
         self.down_proj = BitLinear(self.intermediate_size, self.hidden_size, bias=False)
+        self.down_proj._is_residual_projection = True
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
@@ -64,6 +81,7 @@ class HGRNBitBlock(nn.Module):
     def __init__(self, config: HGRNBitConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
 
         self.attn_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
         self.attn = HGRNBitAttention(
@@ -78,12 +96,29 @@ class HGRNBitBlock(nn.Module):
             layer_idx=layer_idx
         )
         self.mlp_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = HGRNBitMLP(
-            hidden_size=config.hidden_size,
-            hidden_ratio=config.hidden_ratio,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act
-        )
+        moe_layer_indices = set(getattr(config, "moe_layer_indices", []) or [])
+        self.use_moe = bool(config.use_moe and (not moe_layer_indices or layer_idx in moe_layer_indices))
+        if self.use_moe:
+            self.mlp = SparseMoEBlock(
+                hidden_size=config.hidden_size,
+                hidden_ratio=config.hidden_ratio,
+                intermediate_size=config.intermediate_size,
+                num_experts=config.moe_num_experts,
+                top_k=config.moe_num_experts_per_tok,
+                quantized_experts=config.moe_use_quantized_experts,
+                expert_intermediate_factor=getattr(config, "moe_expert_intermediate_factor", 1.0),
+                expert_intermediate_size=getattr(config, "moe_expert_intermediate_size", None),
+                router_bias=config.moe_router_bias,
+                router_jitter_noise=config.moe_router_jitter_noise,
+                normalize_topk_prob=config.moe_normalize_topk_prob,
+            )
+        else:
+            self.mlp = HGRNBitMLP(
+                hidden_size=config.hidden_size,
+                hidden_ratio=config.hidden_ratio,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act
+            )
 
     def forward(
         self,
@@ -93,6 +128,7 @@ class HGRNBitBlock(nn.Module):
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
         lower_bound: Optional[torch.Tensor] = False,
+        output_router_logits: Optional[bool] = False,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
@@ -106,10 +142,20 @@ class HGRNBitBlock(nn.Module):
             lower_bound=lower_bound
         )
         hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
-        hidden_states = self.mlp(hidden_states)
+        router_aux_loss = None
+        router_logits = None
+        router_metrics = None
+        if self.use_moe:
+            hidden_states, router_aux_loss, router_logits, router_metrics = self.mlp(
+                hidden_states,
+                attention_mask=attention_mask,
+                output_router_logits=output_router_logits,
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, attentions, past_key_values)
+        outputs = (hidden_states, attentions, past_key_values, router_aux_loss, router_logits, router_metrics)
 
         return outputs
 
@@ -122,6 +168,24 @@ class HGRNBitPreTrainedModel(PreTrainedModel):
 
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
+
+    def _initialize_missing_keys(self, is_quantized: bool) -> None:
+        # `transformers>=5.8` may leave module-level `_is_hf_initialized` unset even when all
+        # direct parameters were loaded from checkpoint. Its subsequent `initialize_weights()`
+        # pass then re-enters `_init_weights` for those modules and can mutate loaded weights.
+        # Mark leaf modules with fully-loaded direct params/buffers as initialized first.
+        for module in self.modules():
+            if getattr(module, "_is_hf_initialized", False):
+                continue
+            direct_params = list(module.parameters(recurse=False))
+            direct_buffers = [buffer for buffer in module.buffers(recurse=False) if buffer is not None]
+            if not direct_params and not direct_buffers:
+                continue
+            if all(getattr(param, "_is_hf_initialized", False) for param in direct_params) and all(
+                getattr(buffer, "_is_hf_initialized", False) for buffer in direct_buffers
+            ):
+                module._is_hf_initialized = True
+        super()._initialize_missing_keys(is_quantized)
 
     def _init_weights(
         self,
@@ -140,21 +204,18 @@ class HGRNBitPreTrainedModel(PreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
 
-        if rescale_prenorm_residual:
+        if rescale_prenorm_residual and getattr(module, "_is_residual_projection", False):
             # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
             #   > A modified initialization which accounts for the accumulation on the residual path with model depth. Scale
             #   > the weights of residual layers at initialization by a factor of 1/√N where N is the # of residual layers.
             #   >   -- GPT-2 :: https://openai.com/blog/better-language-models/
             #
             # Reference (Megatron-LM): https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/model/gpt_model.py
-            for name, p in module.named_parameters():
-                if name in ["o_proj.weight", "down_proj.weight"]:
-                    # Special Scaled Initialization --> There are 2 Layer Norms per Transformer Block
-                    # Following Pytorch init, except scale by 1/sqrt(2 * n_layer)
-                    # We need to reinit p since this code could be called multiple times
-                    # Having just p *= scale would repeatedly scale it down
-                    with torch.no_grad():
-                        p /= math.sqrt(num_residuals_per_layer * self.config.num_hidden_layers)
+            # Only scale the leaf residual projection itself. Recursing through parent modules
+            # interacts badly with `from_pretrained()` missing-key initialization, because fully
+            # loaded child weights can be rescaled again when an uninitialized parent is visited.
+            with torch.no_grad():
+                module.weight /= math.sqrt(num_residuals_per_layer * self.config.num_hidden_layers)
 
 
 class HGRNBitModel(HGRNBitPreTrainedModel):
@@ -189,13 +250,19 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+    ) -> Union[Tuple, HGRNBitMoEModelOutputWithPast]:
         if output_attentions:
             warnings.warn("`HGRNBitModel` does not `output_attentions` now, setting it to `False`.")
             output_attentions = False
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_router_logits = (
+            output_router_logits
+            if output_router_logits is not None
+            else self.config.moe_output_router_logits
+        )
         use_cache = use_cache if use_cache is not None else (self.config.use_cache if not self.training else False)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -228,6 +295,10 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
 
         all_hidden_states = () if output_hidden_states else None
         all_attns = () if output_attentions else None
+        all_router_logits = () if output_router_logits and self.config.use_moe else None
+        all_router_metrics = () if self.config.use_moe else None
+        router_aux_loss = None
+        moe_layer_count = 0
 
         if self.config.use_lower_bound:
             lower_bounds = self.lower_bounds.softmax(0)
@@ -238,29 +309,45 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
 
             lower_bound = lower_bounds[i] if self.config.use_lower_bound else None
             if self.gradient_checkpointing and self.training:
-                hidden_states, attentions, past_key_values = self._gradient_checkpointing_func(
+                hidden_states, attentions, past_key_values, layer_router_aux_loss, layer_router_logits, layer_router_metrics = self._gradient_checkpointing_func(
                     layer.__call__,
                     hidden_states,
                     attention_mask,
                     past_key_values,
                     use_cache,
                     output_attentions,
-                    lower_bound
+                    lower_bound,
+                    output_router_logits,
                 )
             else:
-                hidden_states, attentions, past_key_values = layer(
+                hidden_states, attentions, past_key_values, layer_router_aux_loss, layer_router_logits, layer_router_metrics = layer(
                     hidden_states,
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
-                    lower_bound=lower_bound
+                    lower_bound=lower_bound,
+                    output_router_logits=output_router_logits,
                 )
 
             if output_attentions:
                 all_attns += (attentions,)
+            if self.config.use_moe:
+                if self.gradient_checkpointing and self.training:
+                    layer_router_aux_loss = None
+                    layer_router_logits = None
+                    layer_router_metrics = None
+                if layer_router_aux_loss is not None:
+                    router_aux_loss = layer_router_aux_loss if router_aux_loss is None else router_aux_loss + layer_router_aux_loss
+                    moe_layer_count += 1
+                if all_router_logits is not None and layer_router_logits is not None:
+                    all_router_logits += (layer_router_logits,)
+                if all_router_metrics is not None and layer_router_metrics is not None:
+                    all_router_metrics += (layer_router_metrics,)
 
         hidden_states = self.norm(hidden_states)
+        if router_aux_loss is not None and moe_layer_count > 0:
+            router_aux_loss = router_aux_loss / moe_layer_count
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -270,17 +357,30 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
         if use_cache:
             next_cache = past_key_values.to_legacy_cache()
         if not return_dict:
-            return tuple(x for x in [hidden_states, next_cache, all_hidden_states, all_attns] if x is not None)
-        return BaseModelOutputWithPast(
+            return tuple(
+                x for x in [
+                    hidden_states,
+                    next_cache,
+                    all_hidden_states,
+                    all_attns,
+                    router_aux_loss,
+                    all_router_logits,
+                    all_router_metrics,
+                ] if x is not None
+            )
+        return HGRNBitMoEModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
-            attentions=all_attns
+            attentions=all_attns,
+            router_aux_loss=router_aux_loss,
+            router_logits=all_router_logits,
+            router_metrics=all_router_metrics,
         )
 
 
 class HGRNBitForCausalLM(HGRNBitPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = None
 
     def __init__(self, config):
         super().__init__(config)
@@ -364,8 +464,9 @@ class HGRNBitForCausalLM(HGRNBitPreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> Union[Tuple, HGRNBitMoECausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -380,13 +481,16 @@ class HGRNBitForCausalLM(HGRNBitPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
             return_dict=return_dict
         )
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
+        router_aux_loss = outputs.router_aux_loss if return_dict else (outputs[4] if len(outputs) > 4 else None)
 
         loss = None
+        lm_loss = None
         if labels is not None:
             if self.config.fuse_cross_entropy:
                 loss_fct = FusedCrossEntropyLoss(inplace_backward=True)
@@ -395,16 +499,23 @@ class HGRNBitForCausalLM(HGRNBitPreTrainedModel, GenerationMixin):
             # Enable model parallelism
             labels = labels.to(logits.device)
             labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], loss_fct.ignore_index)), 1)
-            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+            lm_loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+            loss = lm_loss
+            if router_aux_loss is not None:
+                loss = loss + self.config.moe_router_aux_loss_coef * router_aux_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        return HGRNBitMoECausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            router_aux_loss=outputs.router_aux_loss,
+            router_logits=outputs.router_logits,
+            router_metrics=outputs.router_metrics,
+            lm_loss=lm_loss,
         )

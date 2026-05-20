@@ -68,6 +68,7 @@ class HGRNBitAttention(nn.Module):
 
         self.g_norm = FusedRMSNormSwishGate(self.input_dim, layernorm_eps)
         self.o_proj = BitLinear(self.input_dim, hidden_size, bias=False)
+        self.o_proj._is_residual_projection = True
 
         self.apply(self._initialize_weights)
 

@@ -1,0 +1,80 @@
+{
+  "status": "pass",
+  "dense_model_params": 23224832,
+  "upcycled_model_params": 30319104,
+  "trainable_params": 9457664,
+  "frozen_params": 20861440,
+  "expert_uses_bitlinear": true,
+  "expert_contains_torch_linear": false,
+  "expert_module_types": {
+    "layer_4": [
+      "ExpertMLP",
+      "FusedBitLinear",
+      "RMSNorm",
+      "FusedBitLinear",
+      "RMSNorm"
+    ],
+    "layer_5": [
+      "ExpertMLP",
+      "FusedBitLinear",
+      "RMSNorm",
+      "FusedBitLinear",
+      "RMSNorm"
+    ],
+    "layer_6": [
+      "ExpertMLP",
+      "FusedBitLinear",
+      "RMSNorm",
+      "FusedBitLinear",
+      "RMSNorm"
+    ],
+    "layer_7": [
+      "ExpertMLP",
+      "FusedBitLinear",
+      "RMSNorm",
+      "FusedBitLinear",
+      "RMSNorm"
+    ]
+  },
+  "router_module_types": {
+    "layer_4": [
+      "TopKRouter",
+      "Linear"
+    ],
+    "layer_5": [
+      "TopKRouter",
+      "Linear"
+    ],
+    "layer_6": [
+      "TopKRouter",
+      "Linear"
+    ],
+    "layer_7": [
+      "TopKRouter",
+      "Linear"
+    ]
+  },
+  "dense_layers_preserved": true,
+  "moe_layers_replaced": true,
+  "freeze_checks": {
+    "non_moe_mlp_frozen": true,
+    "embeddings_frozen": true,
+    "router_trainable": true,
+    "expert_trainable": true,
+    "token_mixer_frozen": true,
+    "lm_head_frozen": true
+  },
+  "device": "cuda",
+  "single_step_loss": 10.424036979675293,
+  "lm_loss": 10.404024124145508,
+  "router_aux_loss": 2.0012991428375244,
+  "frozen_params_no_grad": true,
+  "trainable_params_have_grad": true,
+  "trainable_params_with_grad": 68,
+  "initial_expert_similarity": 0.9993984227379163,
+  "monitor_summary": {
+    "avg_expert_similarity": 0.9993984227379163,
+    "num_moe_layers": 4
+  },
+  "issues": []
+}
