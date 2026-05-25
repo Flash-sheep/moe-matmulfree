@@ -325,6 +325,67 @@
    - learning rate
    - `moe_router_aux_loss_coef`
 
+### 6.5 `router_aux_loss_coef` 5k 对照总表
+
+截至 `2026-05-25`，`complement6e_half_top2_alpha005_*_5000step` 这一批 `router aux loss` 对照已经按统一离线口径重新评测。
+
+| Experiment | `router_aux_loss_coef` | best `val_ppl` in train log | `eval_results_64` `val_ppl` | `eval_results_1024` `val_ppl` | `eval_results_1024` router entropy | avg expert similarity |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `complement6e_half_top2_alpha005_aux001_5000step` | `0.001` | `15.8242` | `17.0793` | `17.1550` | `1.6612` | `0.272489` |
+| `complement6e_half_top2_alpha005_aux0005_5000step` | `0.0005` | `15.8199` | `17.0664` | `17.1369` | `1.6879` | `0.272484` |
+| `complement6e_half_top2_alpha005_aux0001_5000step` | `0.0001` | `15.7974` | `17.0382` | `17.1159` | `1.7346` | `0.272485` |
+| `complement6e_half_top2_alpha005_aux00005_5000step` | `0.00005` | `15.8008` | `17.0391` | `17.1125` | `1.7414` | `0.272483` |
+
+从统一复评后的结果看，排序没有变化：按 `eval_results_64` 看，`aux0001` 仍略优；按 `eval_results_1024` 看，`aux00005` 仍最好。这说明之前混入旧口径 `PPL@64` 的问题主要影响绝对数值，不改变这组 `aux sweep` 的相对结论。
+
+### 6.6 新增完成实验结果
+
+截至 `2026-05-24`，又有两组 complement-pair 后续实验完成并拿到统一评测结果。
+
+| Experiment | Change | best `val_ppl` in train log | `eval_results_64` `val_ppl` | `eval_results_1024` `val_ppl` | `eval_results_1024` router entropy | avg expert similarity |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `complement6e_half_top2_alpha005_aux0001_20000step` | 保持 `layer 12-23`，将 `aux=0.0001` 最优 5k 设定延长到 scratch `20000 step` | `15.4997` | `16.7260` | `16.8139` | `1.7675` | `0.268614` |
+| `complement6e_half_top2_alpha005_aux0001_layers6_23_5000step` | 将 MoE 化层数从 `layer 12-23` 扩大到 `layer 6-23`，其余保持 `aux=0.0001` / `5000 step` | `15.9158` | `17.1535` | `17.2318` | `1.7359` | `0.272888` |
+
+这两组结果给出的结论比较明确：
+
+- `aux=0.0001` 的 scratch `20k` 已经优于之前 `aux=0.005` 的 scratch `20k` 主线，说明更低 router aux loss 在 complement-pair 结构上不只是 `5k` 有利，拉长训练后收益仍然保留。
+- `layer 6-23` 的 `18-layer` MoE 化并没有超过标准 `layer 12-23` 的 `12-layer` 版本；在参数规模明显增大的前提下，`5k` 指标反而更差，因此当前不值得优先扩展到这条更深的路线。
+
+### 6.7 本地适配增强实验结果
+
+截至 `2026-05-25`，又完成了两组围绕 `complement6e_half_top2_alpha005_aux0001_5000step` 主结构的本地适配增强实验，并进行了离线复评。
+
+| Experiment | Change | best `val_ppl` in train log | `eval_results_64` `val_ppl` | `eval_results_1024` `val_ppl` | `eval_results_1024` router entropy | avg expert similarity |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `complement6e_half_top2_alpha005_aux0001_unfreeze_moe_norm_5000step` | 仅解冻 `layer12-23` 的 `mlp_norm`，其余仍保持固定 `moe_output_scale=2.0` | `15.8002` | `17.0522` | `17.1132` | `1.7351` | `0.272481` |
+| `complement6e_half_top2_alpha005_aux0001_learnable_pair_scale_5000step` | 保持 RMSNorm 冻结，引入按 `layer/pair` 学习的正值 output scale，初始值 `2.0` | `15.8222` | `17.0573` | `17.1193` | `1.7356` | `0.272543` |
+
+离线复评补充结论：
+
+- 这两组都没有实质性超过标准 `aux=0.0001` `5k` 基线的 `17.0382 / 17.1159`。
+- `unfreeze moe norm` 在 `1024-sample` 上仅有极小幅改善，同时在 `256-sample` 上也仅有极小幅退化；统一口径下，它更接近“基本打平”而不是“明显变差”。
+- `learnable pair-scale` 的 learned scale 明显从 `2.0` 下调，最终 `mean/min/max ≈ 1.819 / 1.721 / 1.890`，说明模型确实在利用这组额外自由度；但 PPL 没有提升，因此“让 scale 可学”本身当前还不构成有效收益。
+- 两组实验的 `avg expert similarity`、`router entropy` 和 `zero ratio` 都与基线几乎一致，说明它们没有改变 complement-pair 路由的整体工作点，只是在输出幅度或局部归一化上做了有限微调。
+- 现阶段更合理的判断是：这两个方向都不应该优先排到 scratch `20k` 前面，主线仍应优先沿标准 `layer12-23` + fixed norm + fixed scale 的 `aux=0.0001` complement-pair 继续推进。
+
+### 6.8 统一复评后的口径纠偏
+
+`2026-05-25` 这次排查确认，历史文档中部分 `PPL@64` 混入了旧评测口径，不能直接和当前离线复评结果横向比较。
+
+当前统一口径为：
+
+- `eval_results_64`: `batch_size=4`, `max_samples=256`
+- `eval_results_1024`: `batch_size=4`, `max_samples=1024`
+
+纠偏后可以明确看到：
+
+- `PPL@1024` 基本一直是稳定的，主线实验相对排序几乎不变。
+- `PPL@64` 的绝对值整体上移了约 `1.2` 到 `1.3`，包括 non-MoE baseline 自身也从旧记录的 `15.9501` 变为统一复评后的 `17.2141`。
+- 因此，之前“某些新实验在 `PPL@64` 上比 baseline 差很多”的现象，主要不是训练代码坏掉，而是旧 baseline 和新复评结果不在同一评测口径。
+- 在统一口径下，标准 `complement6e aux=0.0001 5k` 基线是 `17.0382 / 17.1159`，`unfreeze moe norm` 是 `17.0522 / 17.1132`，`learnable pair-scale` 是 `17.0573 / 17.1193`；三者实际上非常接近。
+- 当前唯一还没能按同口径重刷的主线 active-path-fair 行是 `virtual-group 8e half 20k`，因为原始 output 目录目前找不到，所以总表里它暂时仍保留历史数值。
+
 ## 7. 当前环境状态
 
 当前项目使用 `uv` 管理本地虚拟环境，已确认：

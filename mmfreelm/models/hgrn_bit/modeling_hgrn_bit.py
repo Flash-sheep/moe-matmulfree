@@ -111,6 +111,16 @@ class HGRNBitBlock(nn.Module):
                 router_bias=config.moe_router_bias,
                 router_jitter_noise=config.moe_router_jitter_noise,
                 normalize_topk_prob=config.moe_normalize_topk_prob,
+                grouped_topk=getattr(config, "moe_grouped_topk", False),
+                num_virtual_groups=getattr(config, "moe_num_virtual_groups", 1),
+                topk_per_group=getattr(config, "moe_topk_per_group", 1),
+                routing_mode=getattr(config, "moe_routing_mode", "standard"),
+                pair_weights=getattr(config, "moe_pair_weights", "router"),
+                complement_pairs=getattr(config, "moe_complement_pairs", None),
+                output_scale=getattr(config, "moe_output_scale", 1.0),
+                enable_learnable_output_scale=getattr(config, "moe_enable_learnable_output_scale", False),
+                output_scale_granularity=getattr(config, "moe_output_scale_granularity", "global"),
+                initial_output_scale=getattr(config, "moe_initial_output_scale", getattr(config, "moe_output_scale", 1.0)),
             )
         else:
             self.mlp = HGRNBitMLP(

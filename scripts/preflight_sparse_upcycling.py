@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from itertools import combinations
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from mmfreelm.models.hgrn_bit.modeling_hgrn_bit import HGRNBitForCausalLM
+from mmfreelm.upcycling import ExpertMonitor, StreamingTextDataset, apply_freeze_for_upcycling, upcycle_dense_to_moe
+from scripts.run_sparse_upcycling import collate_streaming_batch
+from scripts.train_moe_lm import ensure_cuda_device, evaluate, flatten_router_metrics
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Preflight initialization check for sparse upcycling configs.")
+    parser.add_argument("--pretrained-path", type=str, required=True)
+    parser.add_argument("--config-path", type=Path, required=True)
+    parser.add_argument("--data-source", type=str, required=True)
+    parser.add_argument("--tokenizer-path", type=str)
+    parser.add_argument("--output-path", type=Path, required=True)
+    parser.add_argument("--run-output-dir", type=Path)
+    parser.add_argument("--device", type=str, default="cuda")
+    return parser.parse_args()
+
+
+def load_config(path: Path) -> Dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def build_loader(data_source: str, tokenizer_path: str, max_length: int, text_field: str, batch_size: int) -> DataLoader:
+    dataset = StreamingTextDataset(
+        data_source=data_source,
+        tokenizer_path=tokenizer_path,
+        max_length=max_length,
+        split="validation",
+        text_field=text_field,
+        max_samples=max(batch_size * 8, 64),
+    )
+    return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_streaming_batch)
+
+
+def quantize_symbols(weight: torch.Tensor) -> torch.Tensor:
+    weight = weight.detach().float().cpu()
+    scale = 1.0 / weight.abs().mean().clamp(min=1e-8)
+    return (weight * scale).round().clamp(-1, 1)
+
+
+def concat_weight_tensors(module) -> torch.Tensor:
+    tensors = []
+    for name, param in module.named_parameters():
+        if "weight" in name and param.dim() >= 2:
+            tensors.append(param.detach().float().cpu().reshape(-1))
+    if not tensors:
+        raise RuntimeError("No matrix weights found for similarity computation.")
+    return torch.cat(tensors, dim=0)
+
+
+def concat_quantized_weight_tensors(module) -> torch.Tensor:
+    tensors = []
+    for name, param in module.named_parameters():
+        if "weight" in name and param.dim() >= 2:
+            tensors.append(quantize_symbols(param).reshape(-1).float())
+    if not tensors:
+        raise RuntimeError("No matrix weights found for ternary similarity computation.")
+    return torch.cat(tensors, dim=0)
+
+
+def pairwise_cosine(vectors: List[torch.Tensor]) -> Dict[str, float]:
+    sims = []
+    for lhs_idx, rhs_idx in combinations(range(len(vectors)), 2):
+        lhs = vectors[lhs_idx]
+        rhs = vectors[rhs_idx]
+        sims.append(float(F.cosine_similarity(lhs.unsqueeze(0), rhs.unsqueeze(0)).item()))
+    sims_tensor = torch.tensor(sims, dtype=torch.float32)
+    return {
+        "mean": float(sims_tensor.mean().item()),
+        "min": float(sims_tensor.min().item()),
+        "max": float(sims_tensor.max().item()),
+    }
+
+
+def compute_zero_ratio(expert) -> Dict[str, float]:
+    zeros = []
+    for name, param in expert.named_parameters():
+        if "weight" in name and param.dim() >= 2:
+            q = quantize_symbols(param)
+            zeros.append(float((q == 0).float().mean().item()))
+    zeros_tensor = torch.tensor(zeros, dtype=torch.float32)
+    return {
+        "mean": float(zeros_tensor.mean().item()),
+        "min": float(zeros_tensor.min().item()),
+        "max": float(zeros_tensor.max().item()),
+    }
+
+
+def compute_hamming_vs_dense(expert, dense_mlp) -> Dict[str, float]:
+    dense_state = dense_mlp.state_dict()
+    distances = []
+    for name, param in expert.named_parameters():
+        if name not in dense_state or "weight" not in name or param.dim() < 2:
+            continue
+        dense_q = quantize_symbols(dense_state[name])
+        expert_q = quantize_symbols(param)
+        if dense_q.shape != expert_q.shape:
+            continue
+        distances.append(float((dense_q != expert_q).float().mean().item()))
+    dist_tensor = torch.tensor(distances, dtype=torch.float32)
+    return {
+        "mean": float(dist_tensor.mean().item()),
+        "min": float(dist_tensor.min().item()),
+        "max": float(dist_tensor.max().item()),
+    }
+
+
+def router_probe(model, moe_layer_indices: List[int], dataloader: DataLoader, device: torch.device) -> Dict[str, object]:
+    batch = next(iter(dataloader))
+    input_ids = batch["input_ids"].to(device)
+    model.eval()
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, labels=input_ids, output_router_logits=True, return_dict=True)
+    flat = flatten_router_metrics(outputs.router_metrics)
+    probe = {
+        "router_entropy": flat.get("router_entropy"),
+        "tokens_per_expert": flat.get("tokens_per_expert"),
+    }
+    if moe_layer_indices:
+        first_router = model.model.layers[moe_layer_indices[0]].mlp.router
+        probe_hidden = torch.randn(64, model.config.hidden_size, device=device, dtype=input_ids.dtype if input_ids.dtype.is_floating_point else torch.float32)
+        probe_hidden = probe_hidden.float()
+        _, _, _, topk_indices = first_router(probe_hidden)
+        if getattr(first_router, "grouped_topk", False):
+            experts_per_group = first_router.experts_per_group
+            group_ids = topk_indices // experts_per_group
+            group_counts = []
+            group_pass = True
+            for group_idx in range(first_router.num_virtual_groups):
+                counts = (group_ids == group_idx).sum(dim=-1)
+                group_counts.append({
+                    "group_id": group_idx,
+                    "unique_counts": sorted({int(v) for v in counts.detach().cpu().tolist()}),
+                })
+                if not torch.all(counts == first_router.topk_per_group):
+                    group_pass = False
+            probe["group_assignment_sanity"] = {
+                "pass": group_pass,
+                "num_virtual_groups": first_router.num_virtual_groups,
+                "topk_per_group": first_router.topk_per_group,
+                "counts": group_counts,
+            }
+        if getattr(first_router, "routing_mode", "standard") in {"strict_complement_pair", "strict_complement_copy_pair"}:
+            complement_pairs = [tuple(pair) for pair in getattr(first_router, "complement_pairs", [])]
+            pair_index = {pair: idx for idx, pair in enumerate(complement_pairs)}
+            sorted_pair_index = {tuple(sorted(pair)): idx for idx, pair in enumerate(complement_pairs)}
+            pair_counts = {str(pair): 0 for pair in complement_pairs}
+            pair_pass = True
+            for row in topk_indices.detach().cpu().tolist():
+                row_pair = tuple(row)
+                sorted_row_pair = tuple(sorted(row_pair))
+                if sorted_row_pair not in sorted_pair_index:
+                    pair_pass = False
+                    continue
+                canonical_pair = complement_pairs[sorted_pair_index[sorted_row_pair]]
+                pair_counts[str(canonical_pair)] += 1
+            probe["complement_pair_sanity"] = {
+                "pass": pair_pass,
+                "pairs": [list(pair) for pair in complement_pairs],
+                "selected_counts": pair_counts,
+            }
+    model.train()
+    return probe
+
+
+def build_eval_args(precision: str, max_eval_batches: int | None) -> argparse.Namespace:
+    return type(
+        "EvalArgs",
+        (),
+        {
+            "precision": precision,
+            "max_eval_batches": max_eval_batches,
+            "use_moe": True,
+        },
+    )()
+
+
+def estimate_active_param_budget(model, moe_layer_indices: List[int], num_experts_per_tok: int) -> Tuple[int, int]:
+    total_params = sum(param.numel() for param in model.parameters())
+    total_expert_params = 0
+    params_per_expert = 0
+    if moe_layer_indices:
+        first_expert = model.model.layers[moe_layer_indices[0]].mlp.experts[0]
+        params_per_expert = sum(param.numel() for param in first_expert.parameters())
+    for layer_idx in moe_layer_indices:
+        total_expert_params += sum(
+            param.numel()
+            for expert in model.model.layers[layer_idx].mlp.experts
+            for param in expert.parameters()
+        )
+    active_expert_params = len(moe_layer_indices) * num_experts_per_tok * params_per_expert
+    active_total_params = total_params - total_expert_params + active_expert_params
+    return active_expert_params, active_total_params
+
+
+def validate_complement_pairs(
+    expert_mapping: Dict[str, object],
+    complement_pairs: List[List[int]],
+    expected_quarters: List[int],
+) -> Dict[str, object]:
+    pair_results = []
+    passed = True
+    for pair in complement_pairs:
+        covered = []
+        for expert_idx in pair:
+            quarters = expert_mapping[str(expert_idx)]
+            covered.extend(int(q) for q in quarters)
+        covered_sorted = sorted(covered)
+        pair_ok = covered_sorted == expected_quarters
+        if not pair_ok:
+            passed = False
+        pair_results.append(
+            {
+                "pair": pair,
+                "covered_quarters": covered_sorted,
+                "covers_all_quarters_exactly_once": pair_ok,
+            }
+        )
+    return {"pass": passed, "pairs": pair_results}
+
+
+def summarize_trainable_parameters(model, moe_layer_indices: List[int]) -> Dict[str, object]:
+    allowed_mlp_norm_names = {f"model.layers.{layer_idx}.mlp_norm.weight" for layer_idx in moe_layer_indices}
+    router_names: List[str] = []
+    expert_names: List[str] = []
+    mlp_norm_names: List[str] = []
+    output_scale_names: List[str] = []
+    other_names: List[str] = []
+    trainable_names: List[str] = []
+    trainable_norm_names: List[str] = []
+
+    count_by_name = {name: param.numel() for name, param in model.named_parameters()}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        trainable_names.append(name)
+        if "norm" in name.lower():
+            trainable_norm_names.append(name)
+        if ".mlp.router." in name:
+            router_names.append(name)
+        elif ".mlp.experts." in name:
+            expert_names.append(name)
+        elif name in allowed_mlp_norm_names:
+            mlp_norm_names.append(name)
+        elif name.endswith("pair_log_scales"):
+            output_scale_names.append(name)
+        else:
+            other_names.append(name)
+
+    def total_numel(names: List[str]) -> int:
+        return sum(count_by_name[name] for name in names)
+
+    return {
+        "trainable_parameter_names": trainable_names,
+        "trainable_parameter_name_summary": {
+            "router": router_names,
+            "experts": expert_names,
+            "moe_layer_mlp_norm": mlp_norm_names,
+            "learnable_output_scale": output_scale_names,
+            "other": other_names,
+        },
+        "trainable_parameter_count_summary": {
+            "router": total_numel(router_names),
+            "experts": total_numel(expert_names),
+            "moe_layer_mlp_norm": total_numel(mlp_norm_names),
+            "learnable_output_scale": total_numel(output_scale_names),
+            "other": total_numel(other_names),
+        },
+        "trainable_rmsnorm_parameter_names": trainable_norm_names,
+        "num_trainable_rmsnorm_parameters": len(trainable_norm_names),
+        "trainable_rmsnorm_parameter_elements": total_numel(trainable_norm_names),
+        "trainable_moe_layer_rmsnorm_names": mlp_norm_names,
+        "num_trainable_moe_layer_rmsnorm_parameters": len(mlp_norm_names),
+        "other_trainable_parameter_names": other_names,
+    }
+
+
+def collect_output_scale_payload(model, moe_layer_indices: List[int]) -> Dict[str, object]:
+    layer_scales: Dict[str, List[float]] = {}
+    scale_values: List[float] = []
+    parameter_names: List[str] = []
+    positive_by_construction = True
+    for layer_idx in moe_layer_indices:
+        moe_block = model.model.layers[layer_idx].mlp
+        if hasattr(moe_block, "pair_log_scales") and moe_block.pair_log_scales is not None:
+            parameter_names.append(f"model.layers.{layer_idx}.mlp.pair_log_scales")
+            current_scales = torch.exp(moe_block.pair_log_scales.detach().float().cpu())
+            layer_scales[f"layer_{layer_idx}"] = [float(v) for v in current_scales.tolist()]
+            scale_values.extend(float(v) for v in current_scales.tolist())
+        else:
+            positive_by_construction = False
+    if not scale_values:
+        return {
+            "number_of_learnable_output_scale_parameters": 0,
+            "learnable_output_scale_parameter_names": [],
+            "initial_scale_values": {},
+            "scale_mean": None,
+            "scale_min": None,
+            "scale_max": None,
+            "scale_positive_by_construction": False,
+        }
+    scale_tensor = torch.tensor(scale_values, dtype=torch.float32)
+    return {
+        "number_of_learnable_output_scale_parameters": len(scale_values),
+        "learnable_output_scale_parameter_names": parameter_names,
+        "initial_scale_values": layer_scales,
+        "scale_mean": float(scale_tensor.mean().item()),
+        "scale_min": float(scale_tensor.min().item()),
+        "scale_max": float(scale_tensor.max().item()),
+        "scale_positive_by_construction": positive_by_construction,
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_config(args.config_path)
+    moe_cfg = config.get("moe", {})
+    freeze_cfg = config.get("freeze", {})
+    training_cfg = config.get("training", {})
+    tokenizer_path = args.tokenizer_path or args.pretrained_path
+    device = ensure_cuda_device(args.device)
+    issues: List[str] = []
+
+    if args.run_output_dir is not None:
+        checkpoint_best = args.run_output_dir / "checkpoint_best"
+        checkpoints_dir = args.run_output_dir / "checkpoints"
+        has_checkpoints = checkpoint_best.exists() or (
+            checkpoints_dir.exists() and any(checkpoints_dir.iterdir())
+        )
+        if has_checkpoints:
+            issues.append(f"Run output dir already contains checkpoints: {args.run_output_dir}")
+
+    base_model = HGRNBitForCausalLM.from_pretrained(args.pretrained_path, torch_dtype=torch.bfloat16)
+    source_model = HGRNBitForCausalLM.from_pretrained(args.pretrained_path, torch_dtype=torch.bfloat16)
+    moe_layer_indices = list(moe_cfg.get("layer_indices", list(range(12, 24))))
+    model = upcycle_dense_to_moe(
+        model=base_model,
+        moe_layer_indices=moe_layer_indices,
+        num_experts=moe_cfg.get("num_experts", 4),
+        num_experts_per_tok=moe_cfg.get("num_experts_per_tok", 2),
+        noise_scale=moe_cfg.get("noise_scale", 0.05),
+        use_quantized_experts=moe_cfg.get("use_quantized_experts", True),
+        router_aux_loss_coef=moe_cfg.get("router_aux_loss_coef", 0.01),
+        router_jitter_noise=moe_cfg.get("router_jitter_noise", 0.0),
+        router_bias=moe_cfg.get("router_bias", False),
+        normalize_topk_prob=moe_cfg.get("normalize_topk_prob", True),
+        expert_intermediate_factor=moe_cfg.get("expert_intermediate_factor", 1.0),
+        init_method=moe_cfg.get("init_method", "copy_noise"),
+        noise_alpha=moe_cfg.get("noise_alpha"),
+        noise_mode=moe_cfg.get("noise_mode", "legacy_global_std"),
+        grouped_topk=moe_cfg.get("grouped_topk", False),
+        num_virtual_groups=moe_cfg.get("num_virtual_groups", 1),
+        topk_per_group=moe_cfg.get("topk_per_group", 1),
+        routing_mode=moe_cfg.get("routing_mode", "standard"),
+        pair_weights=moe_cfg.get("pair_weights", "router"),
+        moe_output_scale=moe_cfg.get("moe_output_scale", 1.0),
+        enable_learnable_output_scale=moe_cfg.get("enable_learnable_moe_output_scale", False),
+        output_scale_granularity=moe_cfg.get("scale_granularity", "global"),
+        initial_moe_output_scale=moe_cfg.get("initial_moe_output_scale"),
+    )
+    trainable_params, frozen_params = apply_freeze_for_upcycling(
+        model=model,
+        moe_layer_indices=moe_layer_indices,
+        freeze_embeddings=freeze_cfg.get("freeze_embeddings", True),
+        freeze_lm_head=freeze_cfg.get("freeze_lm_head", True),
+        freeze_token_mixer=freeze_cfg.get("freeze_token_mixer", True),
+        freeze_non_moe_mlp=freeze_cfg.get("freeze_non_moe_mlp", True),
+        freeze_rmsnorm=freeze_cfg.get("freeze_rmsnorm", True),
+        trainable_extra_patterns=freeze_cfg.get("trainable_extra_patterns", []),
+    )
+    model = model.to(device)
+
+    dataloader = build_loader(
+        data_source=args.data_source,
+        tokenizer_path=tokenizer_path,
+        max_length=training_cfg.get("max_length", 2048),
+        text_field=training_cfg.get("text_field", "text"),
+        batch_size=training_cfg.get("batch_size", 2),
+    )
+    probe = router_probe(model, moe_layer_indices, dataloader, device)
+    eval_args = build_eval_args(training_cfg.get("precision", "bf16"), training_cfg.get("max_eval_batches", 64))
+    init_eval_metrics = evaluate(model, dataloader, device, eval_args)
+
+    trainable_summary = summarize_trainable_parameters(model, moe_layer_indices)
+    layers: Dict[str, object] = {}
+    zero_ratio_values = []
+    for layer_idx in moe_layer_indices:
+        source_mlp = source_model.model.layers[layer_idx].mlp
+        moe_block = model.model.layers[layer_idx].mlp
+        latent_vectors = [concat_weight_tensors(expert) for expert in moe_block.experts]
+        ternary_vectors = [concat_quantized_weight_tensors(expert) for expert in moe_block.experts]
+        latent_stats = pairwise_cosine(latent_vectors)
+        ternary_stats = pairwise_cosine(ternary_vectors)
+        expert_zero = {f"expert_{idx}": compute_zero_ratio(expert) for idx, expert in enumerate(moe_block.experts)}
+        zero_ratio_values.extend([stats["mean"] for stats in expert_zero.values()])
+        layer_payload: Dict[str, object] = {
+            "latent_cosine_similarity": latent_stats,
+            "ternary_projected_similarity": ternary_stats,
+            "ternary_zero_ratio": expert_zero,
+        }
+        if moe_cfg.get("expert_intermediate_factor", 1.0) == 1.0:
+            layer_payload["ternary_hamming_vs_dense_quantized"] = {
+                f"expert_{idx}": compute_hamming_vs_dense(expert, source_mlp) for idx, expert in enumerate(moe_block.experts)
+            }
+        layers[f"layer_{layer_idx}"] = layer_payload
+
+    zero_ratio_avg = float(torch.tensor(zero_ratio_values, dtype=torch.float32).mean().item())
+    if zero_ratio_avg > 0.50 or zero_ratio_avg < 0.20:
+        issues.append(f"Ternary zero ratio out of expected range: {zero_ratio_avg:.4f}")
+
+    other_trainables = trainable_summary["other_trainable_parameter_names"]
+    if other_trainables:
+        issues.append(f"Unexpected trainable parameters outside router/experts/mlp_norm/output_scale: {other_trainables}")
+
+    trainable_mlp_norm_names = set(trainable_summary["trainable_moe_layer_rmsnorm_names"])
+    expected_mlp_norm_names = {f"model.layers.{layer_idx}.mlp_norm.weight" for layer_idx in moe_layer_indices}
+    configured_extra_patterns = freeze_cfg.get("trainable_extra_patterns", [])
+    if configured_extra_patterns:
+        if trainable_mlp_norm_names != expected_mlp_norm_names:
+            issues.append(
+                "Configured trainable extra patterns did not yield exactly the expected MoE-layer mlp_norm weights."
+            )
+
+    group_assignment = None
+    if moe_cfg.get("grouped_topk", False):
+        experts_per_group = moe_cfg["num_experts"] // moe_cfg.get("num_virtual_groups", 1)
+        group_assignment = {str(expert_idx): expert_idx // experts_per_group for expert_idx in range(moe_cfg["num_experts"])}
+        sanity = probe.get("group_assignment_sanity", {})
+        if not sanity.get("pass", False):
+            issues.append("Grouped top-k sanity check failed: tokens were not constrained to one expert per group.")
+
+    complement_payload = None
+    if moe_cfg.get("routing_mode") in {"strict_complement_pair", "strict_complement_copy_pair"}:
+        expert_mapping = {
+            str(expert_idx): list(value)
+            for expert_idx, value in getattr(model.config, "moe_expert_group_assignments", {}).items()
+        }
+        complement_pairs = [list(pair) for pair in getattr(model.config, "moe_complement_pairs", [])]
+        complement_sanity = validate_complement_pairs(expert_mapping, complement_pairs, [0, 1, 2, 3])
+        router_sanity = probe.get("complement_pair_sanity", {"pass": False})
+        if not complement_sanity["pass"]:
+            issues.append("Complement-pair coverage sanity failed: at least one legal pair does not cover Q0-Q3 exactly once.")
+        if not router_sanity.get("pass", False):
+            issues.append("Router complement-pair sanity failed: probe selected an illegal expert pair.")
+        complement_payload = {
+            "expert_composition_mapping": expert_mapping,
+            "legal_complement_pairs": complement_pairs,
+            "complement_pair_coverage_sanity": complement_sanity,
+            "router_complement_pair_sanity": router_sanity,
+            "moe_output_scale": moe_cfg.get("moe_output_scale", 1.0),
+        }
+        if hasattr(model.config, "moe_expert_copy_group_assignments"):
+            complement_payload["copy_group_mapping"] = {
+                str(expert_idx): int(group_idx)
+                for expert_idx, group_idx in getattr(model.config, "moe_expert_copy_group_assignments", {}).items()
+            }
+        if moe_cfg.get("routing_mode") == "strict_complement_copy_pair":
+            complement_payload["legal_path_count"] = len(complement_pairs)
+        if float(moe_cfg.get("moe_output_scale", 1.0)) != 2.0:
+            issues.append(f"Expected moe_output_scale=2.0 for complement-pair experiment, got {moe_cfg.get('moe_output_scale')}.")
+
+    learnable_scale_enabled = bool(moe_cfg.get("enable_learnable_moe_output_scale", False))
+    output_scale_payload = collect_output_scale_payload(model, moe_layer_indices) if learnable_scale_enabled else {}
+    if learnable_scale_enabled:
+        if moe_cfg.get("scale_granularity") != "per_layer_per_pair":
+            issues.append(f"Unsupported scale_granularity for learnable output scale: {moe_cfg.get('scale_granularity')}")
+        if output_scale_payload["number_of_learnable_output_scale_parameters"] == 0:
+            issues.append("Learnable output scale is enabled, but no trainable pair_log_scales were found.")
+        expected_scale_params = len(moe_layer_indices) * len(getattr(model.config, "moe_complement_pairs", []) or [])
+        if output_scale_payload["number_of_learnable_output_scale_parameters"] != expected_scale_params:
+            issues.append(
+                f"Unexpected learnable output scale parameter count: "
+                f"{output_scale_payload['number_of_learnable_output_scale_parameters']} vs expected {expected_scale_params}."
+            )
+        if not output_scale_payload.get("scale_positive_by_construction", False):
+            issues.append("Learnable output scale is not positive by construction.")
+        init_scale = float(moe_cfg.get("initial_moe_output_scale", moe_cfg.get("moe_output_scale", 1.0)))
+        if abs(init_scale - 2.0) > 1e-6:
+            issues.append(f"Expected initial_moe_output_scale=2.0, got {init_scale}.")
+        for layer_name, values in output_scale_payload.get("initial_scale_values", {}).items():
+            if any(abs(value - init_scale) > 1e-6 for value in values):
+                issues.append(f"Learnable output scales in {layer_name} were not initialized to {init_scale}.")
+
+    total_params = sum(param.numel() for param in model.parameters())
+    active_expert_params, active_total_params = estimate_active_param_budget(
+        model,
+        moe_layer_indices=moe_layer_indices,
+        num_experts_per_tok=moe_cfg.get("num_experts_per_tok", 2),
+    )
+    baseline_hidden, baseline_intermediate = source_model.model.layers[moe_layer_indices[0]].mlp.hidden_size, source_model.model.layers[moe_layer_indices[0]].mlp.intermediate_size
+    payload: Dict[str, object] = {
+        "experiment": config.get("experiment_name"),
+        "config_path": str(args.config_path),
+        "pretrained_path": args.pretrained_path,
+        "init_method": moe_cfg.get("init_method", "copy_noise"),
+        "layer_indices": moe_layer_indices,
+        "num_moe_layers": len(moe_layer_indices),
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "frozen_params": frozen_params,
+        "num_experts": moe_cfg.get("num_experts", 4),
+        "top_k": moe_cfg.get("num_experts_per_tok", 2),
+        "expert_intermediate_size": getattr(model.config, "moe_expert_intermediate_size", None),
+        "router_aux_loss_coef": moe_cfg.get("router_aux_loss_coef", 0.01),
+        "noise_alpha": moe_cfg.get("noise_alpha"),
+        "noise_mode": moe_cfg.get("noise_mode", "legacy_global_std"),
+        "active_expert_params_per_token": active_expert_params,
+        "active_total_params_per_token_approx": active_total_params,
+        "active_width_vs_baseline": float(
+            moe_cfg.get("num_experts_per_tok", 2) * getattr(model.config, "moe_expert_intermediate_size", 0)
+        )
+        / float(max(baseline_intermediate, 1)),
+        "router_probe": probe,
+        "init_eval": init_eval_metrics,
+        "expert_metrics_summary": ExpertMonitor(model, moe_layer_indices).compute_metrics()["summary"],
+        "layers": layers,
+        "ternary_zero_ratio_avg": zero_ratio_avg,
+        **trainable_summary,
+    }
+
+    if moe_cfg.get("grouped_topk", False):
+        experts_per_group = moe_cfg["num_experts"] // moe_cfg["num_virtual_groups"]
+        experts = model.model.layers[moe_layer_indices[0]].mlp.experts
+        params_per_expert = sum(param.numel() for param in experts[0].parameters())
+        total_expert_params = 0
+        for layer_idx in moe_layer_indices:
+            total_expert_params += sum(param.numel() for expert in model.model.layers[layer_idx].mlp.experts for param in expert.parameters())
+        active_expert_params = len(moe_layer_indices) * moe_cfg["num_experts_per_tok"] * params_per_expert
+        payload.update(
+            {
+                "active_expert_params_per_token": active_expert_params,
+                "active_total_params_per_token_approx": total_params - total_expert_params + active_expert_params,
+                "num_virtual_groups": moe_cfg.get("num_virtual_groups", 1),
+                "topk_per_group": moe_cfg.get("topk_per_group", 1),
+                "moe_output_scale": moe_cfg.get("moe_output_scale", 1.0),
+                "group_assignment_sanity_check": probe.get("group_assignment_sanity"),
+                "expert_to_shard_id": group_assignment,
+                "experts_per_group": experts_per_group,
+            }
+        )
+    if complement_payload is not None:
+        payload.update(complement_payload)
+    if learnable_scale_enabled:
+        payload.update(
+            {
+                "scale_granularity": moe_cfg.get("scale_granularity", "global"),
+                "initial_moe_output_scale": moe_cfg.get("initial_moe_output_scale", moe_cfg.get("moe_output_scale", 1.0)),
+                **output_scale_payload,
+            }
+        )
+
+    if moe_cfg.get("init_method") == "complement_pair_6e" and float(moe_cfg.get("noise_alpha") or 0.0) == 0.0:
+        dense_eval_args = build_eval_args(training_cfg.get("precision", "bf16"), training_cfg.get("max_eval_batches", 64))
+        source_model = source_model.to(device)
+        dense_eval = evaluate(source_model, dataloader, device, dense_eval_args)
+        payload["dense_reference_eval"] = dense_eval
+        if abs(float(init_eval_metrics["val_ppl"]) - float(dense_eval["val_ppl"])) > 1.0:
+            issues.append(
+                "Alpha=0 complement-pair init deviates strongly from dense reference under preflight eval; "
+                "check fused gate/up split ordering and moe_output_scale."
+            )
+        source_model = source_model.cpu()
+
+    payload["pass"] = len(issues) == 0
+    payload["issues"] = issues
+    args.output_path.parent.mkdir(parents=True, exist_ok=True)
+    args.output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

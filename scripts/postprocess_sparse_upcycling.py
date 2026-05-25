@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from pathlib import Path
+from typing import Dict, List
+
+import torch
+from torch.utils.data import DataLoader
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from mmfreelm.models.hgrn_bit.modeling_hgrn_bit import HGRNBitForCausalLM
+from mmfreelm.upcycling import ExpertMonitor, StreamingTextDataset, apply_freeze_for_upcycling, upcycle_dense_to_moe
+from scripts.complement_pair_diagnostics_lib import aggregate_router_usage
+from scripts.run_sparse_upcycling import collate_streaming_batch
+from scripts.train_moe_lm import ensure_cuda_device, evaluate, get_precision_dtype, precision_context
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Postprocess sparse upcycling outputs.")
+    parser.add_argument("--config-path", type=Path, required=True)
+    parser.add_argument("--pretrained-path", type=str, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--checkpoint-path", type=Path)
+    parser.add_argument("--val-data-source", type=str, required=True)
+    parser.add_argument("--tokenizer-path", type=str, required=True)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="bf16")
+    return parser.parse_args()
+
+
+def load_json(path: Path) -> Dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def load_jsonl(path: Path) -> List[Dict]:
+    if not path.exists():
+        return []
+    records: List[Dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+    return records
+
+
+def build_loader(
+    data_source: str,
+    tokenizer_path: str,
+    max_length: int,
+    text_field: str,
+    batch_size: int,
+    max_samples: int | None,
+) -> DataLoader:
+    dataset = StreamingTextDataset(
+        data_source=data_source,
+        tokenizer_path=tokenizer_path,
+        max_length=max_length,
+        split="validation",
+        text_field=text_field,
+        max_samples=max_samples,
+    )
+    return DataLoader(dataset, batch_size=batch_size, num_workers=0, pin_memory=True, collate_fn=collate_streaming_batch)
+
+
+def compute_ternary_ratios(model, moe_layer_indices: List[int]) -> Dict[str, Dict[str, Dict[str, float]]]:
+    ratios: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for layer_idx in moe_layer_indices:
+        layer_key = f"layer_{layer_idx}"
+        ratios[layer_key] = {}
+        moe = model.model.layers[layer_idx].mlp
+        for expert_idx, expert in enumerate(moe.experts):
+            expert_key = f"expert_{expert_idx}"
+            ratios[layer_key][expert_key] = {}
+            for name, param in expert.named_parameters():
+                if "weight" not in name:
+                    continue
+                weight = param.data.detach().float()
+                scale = 1.0 / weight.abs().mean().clamp_min(1e-6)
+                ternary = (weight * scale).round().clamp(-1, 1)
+                total = ternary.numel()
+                ratios[layer_key][expert_key][name] = {
+                    "neg": float((ternary == -1).sum().item() / total),
+                    "zero": float((ternary == 0).sum().item() / total),
+                    "pos": float((ternary == 1).sum().item() / total),
+                }
+    return ratios
+
+
+def flatten_router_metrics(router_metrics) -> Dict[str, float]:
+    if not router_metrics:
+        return {}
+    result: Dict[str, float] = {}
+    stackable: Dict[str, List[torch.Tensor]] = {}
+    for layer_metrics in router_metrics:
+        for key, value in layer_metrics.items():
+            if isinstance(value, torch.Tensor):
+                stackable.setdefault(key, []).append(value.detach().float().cpu())
+    for key, values in stackable.items():
+        stacked = torch.stack([value if value.ndim > 0 else value.reshape(1) for value in values], dim=0)
+        if key in {"tokens_per_expert", "router_prob_per_expert", "route_load"}:
+            result[key] = stacked.mean(dim=0).tolist()
+        else:
+            result[key] = float(stacked.mean().item())
+    return result
+
+
+@torch.no_grad()
+def evaluate_pair_usage(
+    model: HGRNBitForCausalLM,
+    dataloader: DataLoader,
+    device: torch.device,
+    precision: str,
+    max_eval_batches: int | None,
+) -> Dict:
+    model.eval()
+    precision_dtype, _ = get_precision_dtype(type("Cfg", (), {"precision": precision})())
+    total_loss = 0.0
+    total_lm_loss = 0.0
+    total_router_aux = 0.0
+    total_batches = 0
+    router_metrics_batches = []
+
+    for batch_index, batch in enumerate(dataloader):
+        if max_eval_batches is not None and batch_index >= max_eval_batches:
+            break
+        input_ids = batch["input_ids"].to(device)
+        with precision_context(precision_dtype):
+            outputs = model(
+                input_ids=input_ids,
+                labels=input_ids,
+                output_router_logits=True,
+                return_dict=True,
+            )
+        total_loss += float(outputs.loss.detach().cpu())
+        total_lm_loss += float(outputs.lm_loss.detach().cpu()) if outputs.lm_loss is not None else float(outputs.loss.detach().cpu())
+        total_router_aux += float(outputs.router_aux_loss.detach().cpu()) if outputs.router_aux_loss is not None else 0.0
+        total_batches += 1
+        if outputs.router_metrics:
+            router_metrics_batches.append(outputs.router_metrics)
+
+    if total_batches == 0:
+        raise RuntimeError("Pair-usage evaluation saw zero batches.")
+
+    layer_indices = list(getattr(model.config, "moe_layer_indices", []) or [])
+    usage = aggregate_router_usage(router_metrics_batches, layer_indices)
+    avg_loss = total_loss / total_batches
+    payload = {
+        "val_loss": avg_loss,
+        "val_lm_loss": total_lm_loss / total_batches,
+        "val_router_aux_loss": total_router_aux / total_batches,
+        "val_ppl": float(math.exp(min(avg_loss, 20.0))),
+        "num_batches": total_batches,
+        "pair_usage": usage,
+        "router_entropy": usage.get("mean_router_entropy_across_layers"),
+        "tokens_per_expert": usage.get("global_expert_token_fraction"),
+    }
+    model.train()
+    return payload
+
+
+def build_initial_upcycled_model(config: Dict, pretrained_path: str) -> HGRNBitForCausalLM:
+    seed = int(config.get("seed", 42))
+    torch.manual_seed(seed)
+    base_model = HGRNBitForCausalLM.from_pretrained(pretrained_path, torch_dtype=torch.bfloat16)
+    moe_cfg = config.get("moe", {})
+    freeze_cfg = config.get("freeze", {})
+    moe_layer_indices = list(moe_cfg.get("layer_indices", list(range(12, 24))))
+    model = upcycle_dense_to_moe(
+        model=base_model,
+        moe_layer_indices=moe_layer_indices,
+        num_experts=moe_cfg.get("num_experts", 8),
+        num_experts_per_tok=moe_cfg.get("num_experts_per_tok", 2),
+        noise_scale=moe_cfg.get("noise_scale", 0.05),
+        use_quantized_experts=moe_cfg.get("use_quantized_experts", True),
+        router_aux_loss_coef=moe_cfg.get("router_aux_loss_coef", 0.01),
+        router_jitter_noise=moe_cfg.get("router_jitter_noise", 0.0),
+        router_bias=moe_cfg.get("router_bias", False),
+        normalize_topk_prob=moe_cfg.get("normalize_topk_prob", True),
+        expert_intermediate_factor=moe_cfg.get("expert_intermediate_factor", 1.0),
+        init_method=moe_cfg.get("init_method", "copy_noise"),
+        noise_alpha=moe_cfg.get("noise_alpha"),
+        noise_mode=moe_cfg.get("noise_mode", "legacy_global_std"),
+        grouped_topk=moe_cfg.get("grouped_topk", False),
+        num_virtual_groups=moe_cfg.get("num_virtual_groups", 1),
+        topk_per_group=moe_cfg.get("topk_per_group", 1),
+        routing_mode=moe_cfg.get("routing_mode", "standard"),
+        pair_weights=moe_cfg.get("pair_weights", "router"),
+        moe_output_scale=moe_cfg.get("moe_output_scale", 1.0),
+        enable_learnable_output_scale=moe_cfg.get("enable_learnable_moe_output_scale", False),
+        output_scale_granularity=moe_cfg.get("scale_granularity", "global"),
+        initial_moe_output_scale=moe_cfg.get("initial_moe_output_scale"),
+    )
+    apply_freeze_for_upcycling(
+        model=model,
+        moe_layer_indices=moe_layer_indices,
+        freeze_embeddings=freeze_cfg.get("freeze_embeddings", True),
+        freeze_lm_head=freeze_cfg.get("freeze_lm_head", True),
+        freeze_token_mixer=freeze_cfg.get("freeze_token_mixer", True),
+        freeze_non_moe_mlp=freeze_cfg.get("freeze_non_moe_mlp", True),
+        freeze_rmsnorm=freeze_cfg.get("freeze_rmsnorm", True),
+        trainable_extra_patterns=freeze_cfg.get("trainable_extra_patterns", []),
+    )
+    return model
+
+
+def extract_trainable_norm_payload(config: Dict, pretrained_path: str, final_model: HGRNBitForCausalLM) -> Dict[str, object]:
+    initial_model = build_initial_upcycled_model(config, pretrained_path)
+    trainable_names = []
+    initial_norms = {}
+    final_norms = {}
+    norm_deltas = {}
+    for name, param in initial_model.named_parameters():
+        if param.requires_grad and "norm" in name.lower():
+            trainable_names.append(name)
+            initial_norms[name] = float(param.detach().float().norm().item())
+    for name, param in final_model.named_parameters():
+        if name in initial_norms:
+            final_norms[name] = float(param.detach().float().norm().item())
+            norm_deltas[name] = final_norms[name] - initial_norms[name]
+    return {
+        "trainable_norm_parameter_names": trainable_names,
+        "number_of_trainable_norm_parameter_tensors": len(trainable_names),
+        "initial_norms": initial_norms,
+        "final_norms": final_norms,
+        "norm_deltas": norm_deltas,
+        "gradient_stats_available": False,
+    }
+
+
+def extract_learned_output_scales(model: HGRNBitForCausalLM, moe_layer_indices: List[int]) -> Dict[str, object]:
+    layer_scales = {}
+    values = []
+    pair_names = []
+    complement_pairs = list(getattr(model.config, "moe_complement_pairs", []) or [])
+    for pair_idx, pair in enumerate(complement_pairs):
+        pair_names.append(f"pair{pair_idx}:{tuple(pair)}")
+    for layer_idx in moe_layer_indices:
+        block = model.model.layers[layer_idx].mlp
+        if not hasattr(block, "pair_log_scales") or block.pair_log_scales is None:
+            continue
+        scales = torch.exp(block.pair_log_scales.detach().float().cpu())
+        values.extend(float(v) for v in scales.tolist())
+        layer_scales[f"layer_{layer_idx}"] = {
+            pair_names[idx] if idx < len(pair_names) else f"pair{idx}": float(value)
+            for idx, value in enumerate(scales.tolist())
+        }
+    scale_tensor = torch.tensor(values, dtype=torch.float32) if values else torch.tensor([], dtype=torch.float32)
+    deviations = [abs(v - 2.0) for v in values]
+    return {
+        "scale_granularity": getattr(model.config, "moe_output_scale_granularity", None),
+        "initial_moe_output_scale": getattr(model.config, "moe_initial_output_scale", None),
+        "pair_names": pair_names,
+        "layer_pair_scales": layer_scales,
+        "scale_mean": float(scale_tensor.mean().item()) if values else None,
+        "scale_min": float(scale_tensor.min().item()) if values else None,
+        "scale_max": float(scale_tensor.max().item()) if values else None,
+        "scale_deviation_from_2.0_mean_abs": float(sum(deviations) / len(deviations)) if deviations else None,
+        "has_scale_explosion": bool(values and max(values) > 4.0),
+        "has_scale_collapse": bool(values and min(values) < 1.0),
+    }
+
+
+def build_loss_curve(log_records: List[Dict]) -> Dict[str, List[Dict]]:
+    train_curve = []
+    eval_curve = []
+    for record in log_records:
+        if "train_loss" in record:
+            train_curve.append(
+                {
+                    "step": record["step"],
+                    "train_loss": record.get("train_loss"),
+                    "lm_loss": record.get("lm_loss"),
+                    "router_aux_loss": record.get("router_aux_loss"),
+                    "grad_norm": record.get("grad_norm"),
+                    "lr": record.get("lr"),
+                }
+            )
+        if "val_loss" in record:
+            eval_curve.append(
+                {
+                    "step": record["step"],
+                    "val_loss": record.get("val_loss"),
+                    "val_ppl": record.get("val_ppl"),
+                    "val_router_entropy": record.get("val_router_entropy"),
+                }
+            )
+    return {"train": train_curve, "eval": eval_curve}
+
+
+def build_training_report(
+    config: Dict,
+    init_verification: Dict,
+    log_records: List[Dict],
+    eval64: Dict,
+    eval1024: Dict,
+    pair64: Dict,
+    pair1024: Dict,
+    extras: Dict[str, object],
+) -> Dict[str, object]:
+    freeze_record = next((record for record in log_records if record.get("event") == "freeze"), {})
+    best_checkpoint_record = next((record for record in reversed(log_records) if record.get("event") == "checkpoint_best"), {})
+    return {
+        "experiment_name": config.get("experiment_name"),
+        "description": config.get("description"),
+        "preflight": {
+            "total_params": init_verification.get("total_params"),
+            "trainable_params": init_verification.get("trainable_params"),
+            "frozen_params": init_verification.get("frozen_params"),
+            "ternary_zero_ratio_avg": init_verification.get("ternary_zero_ratio_avg"),
+            "init_eval": init_verification.get("init_eval"),
+        },
+        "training": {
+            "max_steps": config.get("training", {}).get("max_steps"),
+            "freeze_record": freeze_record,
+            "best_checkpoint_record": best_checkpoint_record,
+        },
+        "eval_results": {
+            "eval_results_64": eval64,
+            "eval_results_1024": eval1024,
+            "pair_usage_64": {
+                "val_ppl": pair64.get("val_ppl"),
+                "router_entropy": pair64.get("router_entropy"),
+                "global_pair_fraction": pair64.get("pair_usage", {}).get("global_pair_fraction"),
+                "global_pair_entropy": pair64.get("pair_usage", {}).get("global_pair_entropy"),
+            },
+            "pair_usage_1024": {
+                "val_ppl": pair1024.get("val_ppl"),
+                "router_entropy": pair1024.get("router_entropy"),
+                "global_pair_fraction": pair1024.get("pair_usage", {}).get("global_pair_fraction"),
+                "global_pair_entropy": pair1024.get("pair_usage", {}).get("global_pair_entropy"),
+            },
+        },
+        "extras": extras,
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_json(args.config_path)
+    init_verification_path = args.output_dir / "init_verification.json"
+    init_verification = load_json(init_verification_path) if init_verification_path.exists() else {}
+    log_records = load_jsonl(args.output_dir / "train_log.jsonl")
+    moe_layer_indices = list(config.get("moe", {}).get("layer_indices", list(range(12, 24))))
+    training_cfg = config.get("training", {})
+    device = ensure_cuda_device(args.device)
+    checkpoint_path = args.checkpoint_path or (args.output_dir / "checkpoint_best")
+    if not checkpoint_path.exists():
+        raise SystemExit(f"Checkpoint not found: {checkpoint_path}")
+
+    model = HGRNBitForCausalLM.from_pretrained(str(checkpoint_path), torch_dtype=torch.bfloat16).to(device)
+    text_field = training_cfg.get("text_field", "text")
+    max_length = training_cfg.get("max_length", 2048)
+
+    eval_loader_64 = build_loader(
+        data_source=args.val_data_source,
+        tokenizer_path=args.tokenizer_path,
+        max_length=max_length,
+        text_field=text_field,
+        batch_size=4,
+        max_samples=None,
+    )
+    eval_args_64 = type("EvalArgs", (), {"precision": args.precision, "max_eval_batches": 64, "use_moe": True})()
+    eval_results_64 = evaluate(model, eval_loader_64, device, eval_args_64)
+    write_json(args.output_dir / "eval_results_64.json", eval_results_64)
+
+    eval_loader_1024 = build_loader(
+        data_source=args.val_data_source,
+        tokenizer_path=args.tokenizer_path,
+        max_length=max_length,
+        text_field=text_field,
+        batch_size=4,
+        max_samples=1024,
+    )
+    eval_args_1024 = type("EvalArgs", (), {"precision": args.precision, "max_eval_batches": None, "use_moe": True})()
+    eval_results_1024 = evaluate(model, eval_loader_1024, device, eval_args_1024)
+    write_json(args.output_dir / "eval_results_1024.json", eval_results_1024)
+
+    pair_usage_64 = evaluate_pair_usage(model, eval_loader_64, device, args.precision, max_eval_batches=64)
+    pair_usage_64.update(
+        {
+            "checkpoint_path": str(checkpoint_path),
+            "data_source": args.val_data_source,
+            "tokenizer_path": args.tokenizer_path,
+            "mode": "pair_usage_only",
+            "batch_size": 4,
+            "max_eval_batches": 64,
+            "max_samples": None,
+            "max_length": max_length,
+            "precision": args.precision,
+        }
+    )
+    write_json(args.output_dir / "pair_usage_64.json", pair_usage_64)
+
+    pair_usage_1024 = evaluate_pair_usage(model, eval_loader_1024, device, args.precision, max_eval_batches=None)
+    pair_usage_1024.update(
+        {
+            "checkpoint_path": str(checkpoint_path),
+            "data_source": args.val_data_source,
+            "tokenizer_path": args.tokenizer_path,
+            "mode": "pair_usage_only",
+            "batch_size": 4,
+            "max_eval_batches": None,
+            "max_samples": 1024,
+            "max_length": max_length,
+            "precision": args.precision,
+        }
+    )
+    write_json(args.output_dir / "pair_usage_1024.json", pair_usage_1024)
+
+    ternary_ratios = compute_ternary_ratios(model, moe_layer_indices)
+    write_json(args.output_dir / "ternary_ratios.json", ternary_ratios)
+
+    similarity_history_path = args.output_dir / "expert_metrics.json"
+    similarity_history = load_json(similarity_history_path) if similarity_history_path.exists() else []
+    if not similarity_history:
+        similarity_history = [
+            {"step": record["step"], "avg_expert_similarity": record["avg_expert_similarity"]}
+            for record in log_records
+            if "avg_expert_similarity" in record
+        ]
+        write_json(similarity_history_path, similarity_history)
+    write_json(args.output_dir / "similarity_curve.json", similarity_history)
+
+    loss_curve = build_loss_curve(log_records)
+    write_json(args.output_dir / "loss_curve.json", loss_curve)
+
+    extras: Dict[str, object] = {}
+    if config.get("freeze", {}).get("trainable_extra_patterns"):
+        trainable_norm_payload = extract_trainable_norm_payload(config, args.pretrained_path, model)
+        write_json(args.output_dir / "trainable_norm_params.json", trainable_norm_payload)
+        extras["trainable_norm_params"] = trainable_norm_payload
+    if config.get("moe", {}).get("enable_learnable_moe_output_scale", False):
+        learned_scales_payload = extract_learned_output_scales(model, moe_layer_indices)
+        write_json(args.output_dir / "learned_output_scales.json", learned_scales_payload)
+        extras["learned_output_scales"] = learned_scales_payload
+
+    final_monitor = ExpertMonitor(model, moe_layer_indices).compute_metrics()
+    training_report = build_training_report(
+        config=config,
+        init_verification=init_verification,
+        log_records=log_records,
+        eval64=eval_results_64,
+        eval1024=eval_results_1024,
+        pair64=pair_usage_64,
+        pair1024=pair_usage_1024,
+        extras={
+            **extras,
+            "final_expert_metrics_summary": final_monitor.get("summary"),
+        },
+    )
+    write_json(args.output_dir / "training_report.json", training_report)
+    print(json.dumps({"status": "ok", "output_dir": str(args.output_dir)}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
