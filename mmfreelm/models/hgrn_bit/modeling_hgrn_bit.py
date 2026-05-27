@@ -118,10 +118,16 @@ class HGRNBitBlock(nn.Module):
                 pair_weights=getattr(config, "moe_pair_weights", "router"),
                 complement_pairs=getattr(config, "moe_complement_pairs", None),
                 output_scale=getattr(config, "moe_output_scale", 1.0),
+                coverage_penalty_lambda=getattr(config, "moe_coverage_penalty_lambda", 0.0),
+                free_expert_scale=getattr(config, "moe_free_expert_scale", 0.5),
+                free_expert_exclude_pair_experts=getattr(config, "moe_free_expert_exclude_pair_experts", True),
                 enable_learnable_output_scale=getattr(config, "moe_enable_learnable_output_scale", False),
                 output_scale_granularity=getattr(config, "moe_output_scale_granularity", "global"),
                 initial_output_scale=getattr(config, "moe_initial_output_scale", getattr(config, "moe_output_scale", 1.0)),
             )
+            expert_group_assignments = getattr(config, "moe_expert_group_assignments", None)
+            if expert_group_assignments:
+                self.mlp.router.configure_expert_group_assignments(expert_group_assignments)
         else:
             self.mlp = HGRNBitMLP(
                 hidden_size=config.hidden_size,

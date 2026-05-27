@@ -47,6 +47,9 @@ def upcycle_dense_to_moe(
     routing_mode: str = "standard",
     pair_weights: str = "router",
     moe_output_scale: float = 1.0,
+    coverage_penalty_lambda: float = 0.0,
+    free_expert_scale: float = 0.5,
+    free_expert_exclude_pair_experts: bool = True,
     enable_learnable_output_scale: bool = False,
     output_scale_granularity: str = "global",
     initial_moe_output_scale: float | None = None,
@@ -96,6 +99,9 @@ def upcycle_dense_to_moe(
             pair_weights=pair_weights,
             complement_pairs=complement_pairs,
             output_scale=moe_output_scale,
+            coverage_penalty_lambda=coverage_penalty_lambda,
+            free_expert_scale=free_expert_scale,
+            free_expert_exclude_pair_experts=free_expert_exclude_pair_experts,
             enable_learnable_output_scale=enable_learnable_output_scale,
             output_scale_granularity=output_scale_granularity,
             initial_output_scale=float(initial_moe_output_scale if initial_moe_output_scale is not None else moe_output_scale),
@@ -176,6 +182,31 @@ def upcycle_dense_to_moe(
         if complement_pairs is not None:
             moe_block.complement_pairs = [tuple(pair) for pair in complement_pairs]
             moe_block.router.complement_pairs = [tuple(pair) for pair in complement_pairs]
+        if expert_group_assignments is not None:
+            normalized_group_assignments = {
+                int(expert_idx): [int(q) for q in quarters]
+                for expert_idx, quarters in expert_group_assignments.items()
+            }
+            moe_block.expert_group_assignments = normalized_group_assignments
+            moe_block.router.configure_expert_group_assignments(normalized_group_assignments)
+            if routing_mode == "relaxed_complement_coverage":
+                model.config.moe_relaxed_candidate_pairs = [list(pair) for pair in moe_block.router.candidate_pairs]
+                model.config.moe_relaxed_pair_penalties = [
+                    {
+                        "pair": list(pair),
+                        "coverage_penalty": int(penalty),
+                        "repeated_quarters": int(repeated),
+                        "missing_quarters": int(missing),
+                        "is_strict_complement": bool(strict_flag),
+                    }
+                    for pair, penalty, repeated, missing, strict_flag in zip(
+                        moe_block.router.candidate_pairs,
+                        moe_block.router.candidate_pair_penalties,
+                        moe_block.router.candidate_pair_repeated_quarters,
+                        moe_block.router.candidate_pair_missing_quarters,
+                        moe_block.router.strict_pair_mask,
+                    )
+                ]
 
         block.mlp = moe_block
         block.use_moe = True
@@ -202,6 +233,12 @@ def upcycle_dense_to_moe(
     model.config.moe_routing_mode = routing_mode
     model.config.moe_pair_weights = pair_weights
     model.config.moe_output_scale = moe_output_scale
+    model.config.moe_coverage_penalty_lambda = coverage_penalty_lambda
+    model.config.moe_free_expert_scale = free_expert_scale
+    model.config.moe_free_expert_exclude_pair_experts = free_expert_exclude_pair_experts
+    model.config.moe_free_expert_selection_rule = (
+        "argmax over non-pair experts" if free_expert_exclude_pair_experts else "argmax over all experts"
+    )
     model.config.moe_enable_learnable_output_scale = enable_learnable_output_scale
     model.config.moe_output_scale_granularity = output_scale_granularity
     model.config.moe_initial_output_scale = float(initial_moe_output_scale if initial_moe_output_scale is not None else moe_output_scale)

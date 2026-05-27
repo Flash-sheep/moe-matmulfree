@@ -139,7 +139,7 @@ def router_probe(model, moe_layer_indices: List[int], dataloader: DataLoader, de
         first_router = model.model.layers[moe_layer_indices[0]].mlp.router
         probe_hidden = torch.randn(64, model.config.hidden_size, device=device, dtype=input_ids.dtype if input_ids.dtype.is_floating_point else torch.float32)
         probe_hidden = probe_hidden.float()
-        _, _, _, topk_indices = first_router(probe_hidden)
+        _, _, _, topk_indices, route_info = first_router(probe_hidden)
         if getattr(first_router, "grouped_topk", False):
             experts_per_group = first_router.experts_per_group
             group_ids = topk_indices // experts_per_group
@@ -178,8 +178,57 @@ def router_probe(model, moe_layer_indices: List[int], dataloader: DataLoader, de
                 "pairs": [list(pair) for pair in complement_pairs],
                 "selected_counts": pair_counts,
             }
+        elif getattr(first_router, "routing_mode", "standard") == "relaxed_complement_coverage":
+            candidate_pairs = [tuple(pair) for pair in getattr(first_router, "candidate_pairs", [])]
+            selected_pair_index = route_info.get("selected_pair_index")
+            selected_penalties = route_info.get("coverage_penalty_per_token")
+            strict_pair_mask = route_info.get("strict_pair_mask")
+            probe["relaxed_pair_sanity"] = {
+                "pass": selected_pair_index is not None and selected_penalties is not None and len(candidate_pairs) == 15,
+                "num_candidate_pairs": len(candidate_pairs),
+                "strict_pair_count": int(strict_pair_mask.sum().item()) if strict_pair_mask is not None else None,
+                "selected_pair_index_min": int(selected_pair_index.min().item()) if selected_pair_index is not None else None,
+                "selected_pair_index_max": int(selected_pair_index.max().item()) if selected_pair_index is not None else None,
+                "average_selected_penalty": float(selected_penalties.float().mean().item()) if selected_penalties is not None else None,
+            }
+        elif getattr(first_router, "routing_mode", "standard") == "complement_pair_plus_free":
+            free_overlap = route_info.get("free_expert_overlap")
+            probe["pair_plus_free_sanity"] = {
+                "pass": free_overlap is not None and float(free_overlap.float().max().item()) == 0.0 and topk_indices.shape[-1] == 3,
+                "top_k": int(topk_indices.shape[-1]),
+                "free_expert_overlap_rate": float(free_overlap.float().mean().item()) if free_overlap is not None else None,
+            }
     model.train()
     return probe
+
+
+def build_relaxed_pair_penalty_table(
+    expert_mapping: Dict[str, List[int]],
+    strict_complement_pairs: List[List[int]],
+) -> Dict[str, object]:
+    strict_set = {tuple(sorted(pair)) for pair in strict_complement_pairs}
+    table = []
+    for pair in combinations(sorted(int(k) for k in expert_mapping.keys()), 2):
+        quarter_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+        for expert_idx in pair:
+            for quarter in expert_mapping[str(expert_idx)]:
+                quarter_counts[int(quarter)] += 1
+        repeated_quarters = sum(max(count - 1, 0) for count in quarter_counts.values())
+        missing_quarters = sum(1 for count in quarter_counts.values() if count == 0)
+        table.append(
+            {
+                "pair": list(pair),
+                "covered_quarters": [q for q, count in quarter_counts.items() for _ in range(count)],
+                "coverage_penalty": int(repeated_quarters + missing_quarters),
+                "repeated_quarters": int(repeated_quarters),
+                "missing_quarters": int(missing_quarters),
+                "is_strict_complement": tuple(sorted(pair)) in strict_set,
+            }
+        )
+    return {
+        "all_pairs": [entry["pair"] for entry in table],
+        "coverage_penalty_table": table,
+    }
 
 
 def build_eval_args(precision: str, max_eval_batches: int | None) -> argparse.Namespace:
@@ -352,6 +401,9 @@ def main() -> None:
     base_model = HGRNBitForCausalLM.from_pretrained(args.pretrained_path, torch_dtype=torch.bfloat16)
     source_model = HGRNBitForCausalLM.from_pretrained(args.pretrained_path, torch_dtype=torch.bfloat16)
     moe_layer_indices = list(moe_cfg.get("layer_indices", list(range(12, 24))))
+    baseline_hidden = source_model.model.layers[moe_layer_indices[0]].mlp.hidden_size
+    baseline_intermediate = source_model.model.layers[moe_layer_indices[0]].mlp.intermediate_size
+
     model = upcycle_dense_to_moe(
         model=base_model,
         moe_layer_indices=moe_layer_indices,
@@ -373,6 +425,9 @@ def main() -> None:
         routing_mode=moe_cfg.get("routing_mode", "standard"),
         pair_weights=moe_cfg.get("pair_weights", "router"),
         moe_output_scale=moe_cfg.get("moe_output_scale", 1.0),
+        coverage_penalty_lambda=moe_cfg.get("coverage_penalty_lambda", 0.0),
+        free_expert_scale=moe_cfg.get("free_expert_scale", 0.5),
+        free_expert_exclude_pair_experts=moe_cfg.get("free_expert_exclude_pair_experts", True),
         enable_learnable_output_scale=moe_cfg.get("enable_learnable_moe_output_scale", False),
         output_scale_granularity=moe_cfg.get("scale_granularity", "global"),
         initial_moe_output_scale=moe_cfg.get("initial_moe_output_scale"),
@@ -477,6 +532,69 @@ def main() -> None:
             complement_payload["legal_path_count"] = len(complement_pairs)
         if float(moe_cfg.get("moe_output_scale", 1.0)) != 2.0:
             issues.append(f"Expected moe_output_scale=2.0 for complement-pair experiment, got {moe_cfg.get('moe_output_scale')}.")
+    elif moe_cfg.get("routing_mode") == "relaxed_complement_coverage":
+        expert_mapping = {
+            str(expert_idx): list(value)
+            for expert_idx, value in getattr(model.config, "moe_expert_group_assignments", {}).items()
+        }
+        complement_pairs = [list(pair) for pair in getattr(model.config, "moe_complement_pairs", [])]
+        relaxed_pair_payload = build_relaxed_pair_penalty_table(expert_mapping, complement_pairs)
+        strict_zero_penalty = all(
+            entry["coverage_penalty"] == 0
+            for entry in relaxed_pair_payload["coverage_penalty_table"]
+            if entry["is_strict_complement"]
+        )
+        if len(relaxed_pair_payload["all_pairs"]) != 15:
+            issues.append(f"Expected 15 relaxed candidate pairs, got {len(relaxed_pair_payload['all_pairs'])}.")
+        if not strict_zero_penalty:
+            issues.append("Strict complement pairs must have coverage_penalty=0 under relaxed routing.")
+        if abs(payload_width := (
+            moe_cfg.get("num_experts_per_tok", 2) * getattr(model.config, "moe_expert_intermediate_size", 0) / float(max(baseline_intermediate, 1))
+        ) - 1.0) > 1e-6:
+            issues.append(f"Relaxed top2 active width ratio must be 1.0, got {payload_width:.4f}.")
+        relaxed_probe = probe.get("relaxed_pair_sanity", {})
+        if not relaxed_probe.get("pass", False):
+            issues.append("Relaxed routing probe sanity failed.")
+        complement_payload = {
+            "expert_composition_mapping": expert_mapping,
+            "strict_complement_pairs": complement_pairs,
+            "legal_complement_pairs": complement_pairs,
+            "moe_output_scale": moe_cfg.get("moe_output_scale", 1.0),
+            "coverage_penalty_lambda_schedule": {
+                "mode": "fixed",
+                "coverage_penalty_lambda_start": moe_cfg.get("coverage_penalty_lambda_start", moe_cfg.get("coverage_penalty_lambda", 0.0)),
+                "coverage_penalty_lambda_end": moe_cfg.get("coverage_penalty_lambda_end", moe_cfg.get("coverage_penalty_lambda", 0.0)),
+                "coverage_penalty_anneal_steps": moe_cfg.get("coverage_penalty_anneal_steps", 0),
+            },
+            **relaxed_pair_payload,
+            "router_relaxed_pair_sanity": relaxed_probe,
+        }
+    elif moe_cfg.get("routing_mode") == "complement_pair_plus_free":
+        expert_mapping = {
+            str(expert_idx): list(value)
+            for expert_idx, value in getattr(model.config, "moe_expert_group_assignments", {}).items()
+        }
+        complement_pairs = [list(pair) for pair in getattr(model.config, "moe_complement_pairs", [])]
+        complement_sanity = validate_complement_pairs(expert_mapping, complement_pairs, [0, 1, 2, 3])
+        if not complement_sanity["pass"]:
+            issues.append("Base complement pairs do not cover Q0-Q3 exactly once.")
+        pair_plus_free_probe = probe.get("pair_plus_free_sanity", {})
+        if not pair_plus_free_probe.get("pass", False):
+            issues.append("Pair-plus-free routing probe sanity failed.")
+        if abs(payload_width := (
+            moe_cfg.get("num_experts_per_tok", 3) * getattr(model.config, "moe_expert_intermediate_size", 0) / float(max(baseline_intermediate, 1))
+        ) - 1.5) > 1e-6:
+            issues.append(f"Pair-plus-free active width ratio must be 1.5, got {payload_width:.4f}.")
+        complement_payload = {
+            "expert_composition_mapping": expert_mapping,
+            "strict_complement_pairs": complement_pairs,
+            "legal_complement_pairs": complement_pairs,
+            "complement_pair_coverage_sanity": complement_sanity,
+            "free_expert_selection_rule": getattr(model.config, "moe_free_expert_selection_rule", None),
+            "free_expert_scale": moe_cfg.get("free_expert_scale", 0.5),
+            "moe_output_scale_base_pair": moe_cfg.get("moe_output_scale", 1.0),
+            "router_pair_plus_free_sanity": pair_plus_free_probe,
+        }
 
     learnable_scale_enabled = bool(moe_cfg.get("enable_learnable_moe_output_scale", False))
     output_scale_payload = collect_output_scale_payload(model, moe_layer_indices) if learnable_scale_enabled else {}
@@ -506,7 +624,6 @@ def main() -> None:
         moe_layer_indices=moe_layer_indices,
         num_experts_per_tok=moe_cfg.get("num_experts_per_tok", 2),
     )
-    baseline_hidden, baseline_intermediate = source_model.model.layers[moe_layer_indices[0]].mlp.hidden_size, source_model.model.layers[moe_layer_indices[0]].mlp.intermediate_size
     payload: Dict[str, object] = {
         "experiment": config.get("experiment_name"),
         "config_path": str(args.config_path),

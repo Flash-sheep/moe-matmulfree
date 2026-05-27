@@ -24,8 +24,8 @@ from scripts.run_sparse_upcycling import collate_streaming_batch
 from scripts.train_moe_lm import ensure_cuda_device, get_precision_dtype, precision_context
 
 
-DEFAULT_DATA_SOURCE = "/home/data/yjl/matmulfreellm_assets/datasets/SlimPajama-6B/data"
-DEFAULT_TOKENIZER_PATH = "/home/yjl/yjl-r760/matmulfreellm_assets/checkpoints/MMfreeLM-370M"
+DEFAULT_DATA_SOURCE = str(REPO_ROOT / "datasets" / "SlimPajama-6B" / "data")
+DEFAULT_TOKENIZER_PATH = str(REPO_ROOT / "checkpoints" / "MMfreeLM-370M")
 
 
 @dataclass
@@ -131,6 +131,7 @@ def _compute_layer_usage_payload(
     active_tokens: float,
     router_entropy_sum: float,
     batch_count: int,
+    extras: Optional[Dict[str, object]] = None,
 ) -> Dict:
     pair_counts = pair_counts.float()
     expert_counts = expert_counts.float()
@@ -170,6 +171,8 @@ def _compute_layer_usage_payload(
         "expert_load_imbalance": expert_load_imbalance,
         "router_entropy": router_entropy_sum / max(batch_count, 1),
     }
+    if extras:
+        payload.update(extras)
     return payload
 
 
@@ -198,6 +201,27 @@ def aggregate_router_usage(
     active_tokens_by_layer: Dict[int, float] = {}
     router_entropy_sum_by_layer: Dict[int, float] = {}
     batch_count_by_layer: Dict[int, int] = {}
+    scalar_metric_sums_by_layer: Dict[int, Dict[str, float]] = {}
+    vector_metric_sums_by_layer: Dict[int, Dict[str, torch.Tensor]] = {}
+    weighted_scalar_metric_sums: Dict[str, float] = {}
+    weighted_scalar_metric_weights: Dict[str, float] = {}
+
+    scalar_metric_names = {
+        "strict_complement_pair_fraction",
+        "non_complement_pair_fraction",
+        "average_coverage_penalty",
+        "repeated_quarter_frequency",
+        "missing_quarter_frequency",
+        "free_expert_entropy",
+        "free_expert_entropy_normalized",
+        "free_expert_overlap_rate",
+        "base_output_norm",
+        "free_output_norm",
+        "final_output_norm",
+        "active_width_ratio",
+        "free_expert_scale",
+    }
+    vector_metric_names = {"free_expert_route_load", "free_expert_fraction"}
 
     for batch_metrics in router_metrics_batches:
         for layer_idx, layer_metrics in zip(layer_indices, batch_metrics):
@@ -214,6 +238,27 @@ def aggregate_router_usage(
                 expert_counts_cpu = expert_counts.detach().float().cpu()
                 expert_counts_by_layer.setdefault(layer_idx, torch.zeros_like(expert_counts_cpu))
                 expert_counts_by_layer[layer_idx] += expert_counts_cpu
+            for metric_name in scalar_metric_names:
+                metric_value = layer_metrics.get(metric_name)
+                if metric_value is None:
+                    continue
+                scalar_metric_sums_by_layer.setdefault(layer_idx, {})
+                scalar_metric_sums_by_layer[layer_idx][metric_name] = (
+                    scalar_metric_sums_by_layer[layer_idx].get(metric_name, 0.0) + float(metric_value.detach().float().cpu().item())
+                )
+                weighted_scalar_metric_sums[metric_name] = weighted_scalar_metric_sums.get(metric_name, 0.0) + (
+                    float(metric_value.detach().float().cpu().item()) * max(active_tokens, 1.0)
+                )
+                weighted_scalar_metric_weights[metric_name] = weighted_scalar_metric_weights.get(metric_name, 0.0) + max(active_tokens, 1.0)
+            for metric_name in vector_metric_names:
+                metric_value = layer_metrics.get(metric_name)
+                if metric_value is None:
+                    continue
+                metric_cpu = metric_value.detach().float().cpu()
+                vector_metric_sums_by_layer.setdefault(layer_idx, {})
+                if metric_name not in vector_metric_sums_by_layer[layer_idx]:
+                    vector_metric_sums_by_layer[layer_idx][metric_name] = torch.zeros_like(metric_cpu)
+                vector_metric_sums_by_layer[layer_idx][metric_name] += metric_cpu
             active_tokens_by_layer[layer_idx] = active_tokens_by_layer.get(layer_idx, 0.0) + active_tokens
             router_entropy_sum_by_layer[layer_idx] = router_entropy_sum_by_layer.get(layer_idx, 0.0) + router_entropy
             batch_count_by_layer[layer_idx] = batch_count_by_layer.get(layer_idx, 0) + 1
@@ -231,6 +276,13 @@ def aggregate_router_usage(
         layer_expert_counts = expert_counts_by_layer.get(layer_idx)
         if layer_pair_counts is None or layer_expert_counts is None:
             continue
+        layer_extras: Dict[str, object] = {}
+        scalar_layer_metrics = scalar_metric_sums_by_layer.get(layer_idx, {})
+        for metric_name, metric_sum in scalar_layer_metrics.items():
+            layer_extras[metric_name] = metric_sum / max(batch_count_by_layer.get(layer_idx, 1), 1)
+        vector_layer_metrics = vector_metric_sums_by_layer.get(layer_idx, {})
+        for metric_name, metric_sum in vector_layer_metrics.items():
+            layer_extras[metric_name] = _tensor_to_list(metric_sum / max(batch_count_by_layer.get(layer_idx, 1), 1))
         payload = _compute_layer_usage_payload(
             layer_idx=layer_idx,
             pair_counts=layer_pair_counts,
@@ -238,6 +290,7 @@ def aggregate_router_usage(
             active_tokens=active_tokens_by_layer.get(layer_idx, 0.0),
             router_entropy_sum=router_entropy_sum_by_layer.get(layer_idx, 0.0),
             batch_count=batch_count_by_layer.get(layer_idx, 1),
+            extras=layer_extras,
         )
         per_layer.append(payload)
         pair_imbalance_by_layer[str(layer_idx)] = payload["pair_load_imbalance"]
@@ -266,7 +319,7 @@ def aggregate_router_usage(
     expert_entropy_norm = _normalized_entropy_from_fraction(global_expert_share_normalized)
     expert_load_imbalance = float((global_expert_share_normalized.max() - global_expert_share_normalized.min()).item())
 
-    return {
+    global_payload = {
         "num_layers": len(per_layer),
         "per_layer": per_layer,
         "pair_load_imbalance_by_layer": pair_imbalance_by_layer,
@@ -284,6 +337,26 @@ def aggregate_router_usage(
         "expert_load_imbalance": expert_load_imbalance,
         "mean_router_entropy_across_layers": global_router_entropy / max(global_router_batches, 1),
     }
+
+    for metric_name, weighted_sum in weighted_scalar_metric_sums.items():
+        global_payload[metric_name] = weighted_sum / max(weighted_scalar_metric_weights.get(metric_name, 1.0), 1.0)
+
+    if any("free_expert_route_load" in metrics for metrics in vector_metric_sums_by_layer.values()):
+        global_free_expert_counts = None
+        for layer_metrics in vector_metric_sums_by_layer.values():
+            metric_value = layer_metrics.get("free_expert_route_load")
+            if metric_value is None:
+                continue
+            global_free_expert_counts = metric_value if global_free_expert_counts is None else global_free_expert_counts + metric_value
+        if global_free_expert_counts is not None:
+            global_free_expert_fraction = global_free_expert_counts / max(global_active_tokens, 1.0)
+            safe_fraction = global_free_expert_fraction.clamp_min(1e-9)
+            global_payload["global_free_expert_count"] = _tensor_to_list(global_free_expert_counts)
+            global_payload["global_free_expert_fraction"] = _tensor_to_list(global_free_expert_fraction)
+            global_payload["global_free_expert_entropy"] = _entropy_from_fraction(safe_fraction)
+            global_payload["global_free_expert_entropy_normalized"] = _normalized_entropy_from_fraction(safe_fraction)
+
+    return global_payload
 
 
 def evaluate_with_router_diagnostics(

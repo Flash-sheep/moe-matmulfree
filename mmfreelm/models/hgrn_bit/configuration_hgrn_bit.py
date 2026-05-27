@@ -51,6 +51,9 @@ class HGRNBitConfig(PretrainedConfig):
         moe_pair_weights: str = "router",
         moe_complement_pairs: Optional[list] = None,
         moe_output_scale: float = 1.0,
+        moe_coverage_penalty_lambda: float = 0.0,
+        moe_free_expert_scale: float = 0.5,
+        moe_free_expert_exclude_pair_experts: bool = True,
         moe_enable_learnable_output_scale: bool = False,
         moe_output_scale_granularity: str = "global",
         moe_initial_output_scale: float = 1.0,
@@ -101,6 +104,9 @@ class HGRNBitConfig(PretrainedConfig):
         self.moe_pair_weights = moe_pair_weights
         self.moe_complement_pairs = [] if moe_complement_pairs is None else list(moe_complement_pairs)
         self.moe_output_scale = moe_output_scale
+        self.moe_coverage_penalty_lambda = moe_coverage_penalty_lambda
+        self.moe_free_expert_scale = moe_free_expert_scale
+        self.moe_free_expert_exclude_pair_experts = moe_free_expert_exclude_pair_experts
         self.moe_enable_learnable_output_scale = moe_enable_learnable_output_scale
         self.moe_output_scale_granularity = moe_output_scale_granularity
         self.moe_initial_output_scale = moe_initial_output_scale

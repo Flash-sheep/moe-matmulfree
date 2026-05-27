@@ -199,6 +199,9 @@ def build_initial_upcycled_model(config: Dict, pretrained_path: str) -> HGRNBitF
         routing_mode=moe_cfg.get("routing_mode", "standard"),
         pair_weights=moe_cfg.get("pair_weights", "router"),
         moe_output_scale=moe_cfg.get("moe_output_scale", 1.0),
+        coverage_penalty_lambda=moe_cfg.get("coverage_penalty_lambda", 0.0),
+        free_expert_scale=moe_cfg.get("free_expert_scale", 0.5),
+        free_expert_exclude_pair_experts=moe_cfg.get("free_expert_exclude_pair_experts", True),
         enable_learnable_output_scale=moe_cfg.get("enable_learnable_moe_output_scale", False),
         output_scale_granularity=moe_cfg.get("scale_granularity", "global"),
         initial_moe_output_scale=moe_cfg.get("initial_moe_output_scale"),
@@ -300,6 +303,62 @@ def build_loss_curve(log_records: List[Dict]) -> Dict[str, List[Dict]]:
     return {"train": train_curve, "eval": eval_curve}
 
 
+def build_relaxed_pair_usage_payload(model: HGRNBitForCausalLM, pair_usage_1024: Dict[str, object]) -> Dict[str, object]:
+    usage = pair_usage_1024.get("pair_usage", {})
+    global_pair_fraction = usage.get("global_pair_fraction", []) or []
+    per_layer = usage.get("per_layer", []) or []
+    pair_metadata = list(getattr(model.config, "moe_relaxed_pair_penalties", []) or [])
+    strict_pair_indices = [idx for idx, entry in enumerate(pair_metadata) if entry.get("is_strict_complement")]
+    non_strict_pair_indices = [idx for idx, entry in enumerate(pair_metadata) if not entry.get("is_strict_complement")]
+    strict_fraction = sum(global_pair_fraction[idx] for idx in strict_pair_indices if idx < len(global_pair_fraction))
+    non_strict_fraction = sum(global_pair_fraction[idx] for idx in non_strict_pair_indices if idx < len(global_pair_fraction))
+    per_layer_pair_usage = {
+        f"layer_{entry['layer_index']}": entry.get("pair_fraction", [])
+        for entry in per_layer
+    }
+    return {
+        "all_15_pair_fractions": [
+            {
+                "pair_index": idx,
+                "pair": entry.get("pair"),
+                "fraction": float(global_pair_fraction[idx]) if idx < len(global_pair_fraction) else 0.0,
+                "coverage_penalty": entry.get("coverage_penalty"),
+                "repeated_quarters": entry.get("repeated_quarters"),
+                "missing_quarters": entry.get("missing_quarters"),
+                "is_strict_complement": bool(entry.get("is_strict_complement", False)),
+            }
+            for idx, entry in enumerate(pair_metadata)
+        ],
+        "strict_complement_pair_fraction": float(strict_fraction),
+        "non_complement_pair_fraction": float(non_strict_fraction),
+        "average_coverage_penalty": usage.get("average_coverage_penalty"),
+        "repeated_quarter_frequency": usage.get("repeated_quarter_frequency"),
+        "missing_quarter_frequency": usage.get("missing_quarter_frequency"),
+        "per_layer_pair_usage": per_layer_pair_usage,
+    }
+
+
+def build_free_expert_usage_payload(pair_usage_1024: Dict[str, object]) -> Dict[str, object]:
+    usage = pair_usage_1024.get("pair_usage", {})
+    per_layer = usage.get("per_layer", []) or []
+    return {
+        "base_pair_usage": usage.get("global_pair_fraction"),
+        "free_expert_usage": usage.get("global_free_expert_fraction"),
+        "free_expert_entropy": usage.get("global_free_expert_entropy", usage.get("free_expert_entropy")),
+        "free_expert_entropy_normalized": usage.get("global_free_expert_entropy_normalized", usage.get("free_expert_entropy_normalized")),
+        "free_expert_overlap_repetition_rate": usage.get("free_expert_overlap_rate"),
+        "base_output_norm": usage.get("base_output_norm"),
+        "free_output_norm": usage.get("free_output_norm"),
+        "final_output_norm": usage.get("final_output_norm"),
+        "active_width_ratio": usage.get("active_width_ratio"),
+        "per_layer_free_expert_usage": {
+            f"layer_{entry['layer_index']}": entry.get("free_expert_fraction", [])
+            for entry in per_layer
+            if "free_expert_fraction" in entry
+        },
+    }
+
+
 def build_training_report(
     config: Dict,
     init_verification: Dict,
@@ -315,6 +374,9 @@ def build_training_report(
     return {
         "experiment_name": config.get("experiment_name"),
         "description": config.get("description"),
+        "base_checkpoint_path": init_verification.get("pretrained_path"),
+        "optimizer_resumed": False,
+        "scheduler_resumed": False,
         "preflight": {
             "total_params": init_verification.get("total_params"),
             "trainable_params": init_verification.get("trainable_params"),
@@ -324,6 +386,12 @@ def build_training_report(
         },
         "training": {
             "max_steps": config.get("training", {}).get("max_steps"),
+            "estimated_tokens_trained": (
+                int(config.get("training", {}).get("batch_size", 0))
+                * int(config.get("training", {}).get("gradient_accumulation_steps", 0))
+                * int(config.get("training", {}).get("max_length", 0))
+                * int(config.get("training", {}).get("max_steps", 0))
+            ),
             "freeze_record": freeze_record,
             "best_checkpoint_record": best_checkpoint_record,
         },
@@ -343,6 +411,7 @@ def build_training_report(
                 "global_pair_entropy": pair1024.get("pair_usage", {}).get("global_pair_entropy"),
             },
         },
+        "final_ppl_1024": eval1024.get("val_ppl"),
         "extras": extras,
     }
 
@@ -419,6 +488,14 @@ def main() -> None:
         }
     )
     write_json(args.output_dir / "pair_usage_1024.json", pair_usage_1024)
+
+    routing_mode = config.get("moe", {}).get("routing_mode", "standard")
+    if routing_mode == "relaxed_complement_coverage":
+        relaxed_pair_usage = build_relaxed_pair_usage_payload(model, pair_usage_1024)
+        write_json(args.output_dir / "relaxed_pair_usage_1024.json", relaxed_pair_usage)
+    elif routing_mode == "complement_pair_plus_free":
+        free_expert_usage = build_free_expert_usage_payload(pair_usage_1024)
+        write_json(args.output_dir / "free_expert_usage_1024.json", free_expert_usage)
 
     ternary_ratios = compute_ternary_ratios(model, moe_layer_indices)
     write_json(args.output_dir / "ternary_ratios.json", ternary_ratios)
