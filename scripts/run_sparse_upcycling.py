@@ -7,7 +7,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Dict, Iterator
+from typing import Dict, Iterator, List
 
 import torch
 from torch.utils.data import DataLoader
@@ -22,6 +22,19 @@ from mmfreelm.upcycling import (
     StreamingTextDataset,
     apply_freeze_for_upcycling,
     upcycle_dense_to_moe,
+)
+from mmfreelm.upcycling.param_groups import (
+    build_optimizer_param_groups,
+    optimizer_lr_map,
+    resolve_optimizer_hparams,
+    run_strict_trainable_checks,
+)
+from mmfreelm.upcycling.trainable_scope import (
+    infer_freeze_mode,
+    infer_norm_scope,
+    infer_strict_trainable_check,
+    resolve_local_backbone_layer_indices,
+    summarize_trainable_parameters,
 )
 from scripts.train_moe_lm import (
     append_jsonl,
@@ -56,6 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int)
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"])
     parser.add_argument("--device", type=str)
+    parser.add_argument("--preflight-only", action="store_true")
     return parser.parse_args()
 
 
@@ -118,6 +132,77 @@ def load_best_val_loss(log_path: Path):
     return best_val_loss
 
 
+def write_trainable_debug_outputs(
+    output_dir: Path,
+    trainable_summary: Dict[str, object],
+    optimizer_group_summary: List[Dict[str, object]],
+):
+    names_path = output_dir / "trainable_param_names.txt"
+    names_path.write_text(
+        "\n".join(trainable_summary["trainable_parameter_names"]) + ("\n" if trainable_summary["trainable_parameter_names"] else ""),
+        encoding="utf-8",
+    )
+    (output_dir / "trainable_param_summary.json").write_text(
+        json.dumps(trainable_summary, ensure_ascii=False, indent=2, default=json_default) + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "optimizer_param_groups.json").write_text(
+        json.dumps(optimizer_group_summary, ensure_ascii=False, indent=2, default=json_default) + "\n",
+        encoding="utf-8",
+    )
+
+
+def build_init_verification_payload(
+    *,
+    config: Dict,
+    args: argparse.Namespace,
+    model,
+    trainable_params: int,
+    frozen_params: int,
+    trainable_summary: Dict[str, object],
+    optimizer_group_summary: List[Dict[str, object]],
+    freeze_mode: str,
+    norm_scope: str,
+    moe_layer_indices: List[int],
+    local_backbone_layer_indices: List[int],
+    optimizer_hparams: Dict[str, float],
+    strict_trainable_check: bool,
+    hard_check_issues: List[str],
+    warnings: List[str],
+) -> Dict[str, object]:
+    total_params = sum(param.numel() for param in model.parameters())
+    return {
+        "experiment": config.get("experiment_name"),
+        "config_path": str(args.config_path),
+        "pretrained_path": args.pretrained_path,
+        "output_dir": str(args.output_dir),
+        "pass": len(hard_check_issues) == 0,
+        "issues": hard_check_issues,
+        "warnings": warnings,
+        "preflight_only": bool(args.preflight_only),
+        "freeze_mode": freeze_mode,
+        "norm_scope": norm_scope,
+        "strict_trainable_check": strict_trainable_check,
+        "freeze_embeddings": bool(config.get("freeze", {}).get("freeze_embeddings", True)),
+        "freeze_lm_head": bool(config.get("freeze", {}).get("freeze_lm_head", True)),
+        "moe_layer_indices": moe_layer_indices,
+        "local_backbone_layer_indices": local_backbone_layer_indices,
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "frozen_params": frozen_params,
+        "optimizer_hparams": optimizer_hparams,
+        "trainable_parameter_counts_by_module_type": trainable_summary["trainable_parameter_counts_by_module_type"],
+        "trainable_parameter_tensors_by_module_type": trainable_summary["trainable_parameter_tensors_by_module_type"],
+        "first_200_trainable_parameter_names": trainable_summary["first_200_trainable_parameter_names"],
+        "extra_pattern_enabled_parameter_names": trainable_summary["extra_pattern_enabled_parameter_names"],
+        "extra_pattern_enabled_parameter_count": trainable_summary["extra_pattern_enabled_parameter_count"],
+        "selected_norm_parameter_names": trainable_summary["selected_norm_parameter_names"],
+        "selected_norm_parameter_count": trainable_summary["selected_norm_parameter_count"],
+        "local_backbone_parameter_count": trainable_summary["local_backbone_parameter_count"],
+        "optimizer_group_summary": optimizer_group_summary,
+    }
+
+
 def main() -> None:
     args = parse_args()
     if args.resume_from is not None:
@@ -133,6 +218,15 @@ def main() -> None:
     moe_cfg = config.get("moe", {})
     freeze_cfg = config.get("freeze", {})
     dense_baseline = bool(config.get("dense_baseline", False))
+    freeze_mode = infer_freeze_mode(freeze_cfg, dense_baseline=dense_baseline)
+    norm_scope = infer_norm_scope(freeze_cfg, freeze_mode)
+    moe_layer_indices = moe_cfg.get("layer_indices", list(range(12, 24)))
+    local_backbone_layer_indices = resolve_local_backbone_layer_indices(
+        moe_layer_indices=moe_layer_indices,
+        local_backbone_layer_indices=freeze_cfg.get("local_backbone_layer_indices"),
+    )
+    strict_trainable_check = infer_strict_trainable_check(freeze_cfg, config)
+    optimizer_hparams = resolve_optimizer_hparams(config, training, freeze_cfg, freeze_mode)
 
     seed = args.seed if args.seed is not None else config.get("seed", 42)
     precision = args.precision or training.get("precision", "bf16")
@@ -157,7 +251,6 @@ def main() -> None:
     (output_dir / "config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     tokenizer_path = args.tokenizer_path or args.pretrained_path
-    moe_layer_indices = moe_cfg.get("layer_indices", list(range(12, 24)))
     if args.resume_from is not None:
         model = HGRNBitForCausalLM.from_pretrained(str(args.resume_from), torch_dtype=torch.bfloat16)
         moe_layer_indices = list(getattr(model.config, "moe_layer_indices", None) or moe_layer_indices)
@@ -196,32 +289,108 @@ def main() -> None:
                 output_scale_granularity=moe_cfg.get("scale_granularity", "global"),
                 initial_moe_output_scale=moe_cfg.get("initial_moe_output_scale"),
             )
-    if dense_baseline:
-        for param in model.parameters():
-            param.requires_grad = True
-        trainable_params = sum(param.numel() for param in model.parameters())
-        frozen_params = 0
-    else:
-        trainable_params, frozen_params = apply_freeze_for_upcycling(
-            model=model,
-            moe_layer_indices=moe_layer_indices,
+    trainable_params, frozen_params = apply_freeze_for_upcycling(
+        model=model,
+        moe_layer_indices=moe_layer_indices,
+        freeze_embeddings=freeze_cfg.get("freeze_embeddings", True),
+        freeze_lm_head=freeze_cfg.get("freeze_lm_head", True),
+        freeze_token_mixer=freeze_cfg.get("freeze_token_mixer", True),
+        freeze_non_moe_mlp=freeze_cfg.get("freeze_non_moe_mlp", True),
+        freeze_rmsnorm=freeze_cfg.get("freeze_rmsnorm", True),
+        trainable_extra_patterns=freeze_cfg.get("trainable_extra_patterns", []),
+        freeze_mode=freeze_mode,
+        local_backbone_layer_indices=local_backbone_layer_indices,
+        norm_scope=norm_scope,
+        dense_baseline=dense_baseline,
+    )
+    trainable_summary = summarize_trainable_parameters(
+        model=model,
+        freeze_mode=freeze_mode,
+        moe_layer_indices=moe_layer_indices,
+        local_backbone_layer_indices=local_backbone_layer_indices,
+        norm_scope=norm_scope,
+        trainable_extra_patterns=freeze_cfg.get("trainable_extra_patterns", []),
+    )
+    optimizer_param_groups, optimizer_group_summary = build_optimizer_param_groups(
+        model=model,
+        freeze_mode=freeze_mode,
+        moe_lr=optimizer_hparams["moe_lr"],
+        backbone_lr=optimizer_hparams["backbone_lr"],
+        norm_lr=optimizer_hparams["norm_lr"],
+        embed_lr=optimizer_hparams["embed_lr"],
+        weight_decay=optimizer_hparams["weight_decay"],
+        local_backbone_layer_indices=local_backbone_layer_indices,
+    )
+    hard_check_issues = (
+        run_strict_trainable_checks(
+            trainable_summary=trainable_summary,
+            optimizer_group_summary=optimizer_group_summary,
+            freeze_mode=freeze_mode,
             freeze_embeddings=freeze_cfg.get("freeze_embeddings", True),
             freeze_lm_head=freeze_cfg.get("freeze_lm_head", True),
-            freeze_token_mixer=freeze_cfg.get("freeze_token_mixer", True),
-            freeze_non_moe_mlp=freeze_cfg.get("freeze_non_moe_mlp", True),
-            freeze_rmsnorm=freeze_cfg.get("freeze_rmsnorm", True),
-            trainable_extra_patterns=freeze_cfg.get("trainable_extra_patterns", []),
+            local_backbone_layer_indices=local_backbone_layer_indices,
         )
+        if strict_trainable_check
+        else []
+    )
+    warnings: List[str] = []
+    if trainable_summary["extra_pattern_enabled_parameter_count"] > 32:
+        warnings.append(
+            "trainable_extra_patterns enabled more than 32 additional parameters; verify that scope expansion is intended."
+        )
+    write_trainable_debug_outputs(output_dir, trainable_summary, optimizer_group_summary)
+    init_verification = build_init_verification_payload(
+        config=config,
+        args=args,
+        model=model,
+        trainable_params=trainable_params,
+        frozen_params=frozen_params,
+        trainable_summary=trainable_summary,
+        optimizer_group_summary=optimizer_group_summary,
+        freeze_mode=freeze_mode,
+        norm_scope=norm_scope,
+        moe_layer_indices=moe_layer_indices,
+        local_backbone_layer_indices=local_backbone_layer_indices,
+        optimizer_hparams=optimizer_hparams,
+        strict_trainable_check=strict_trainable_check,
+        hard_check_issues=hard_check_issues,
+        warnings=warnings,
+    )
+    (output_dir / "init_verification.json").write_text(
+        json.dumps(init_verification, ensure_ascii=False, indent=2, default=json_default) + "\n",
+        encoding="utf-8",
+    )
     append_jsonl(
         output_dir / "train_log.jsonl",
         {
             "event": "freeze",
+            "freeze_mode": freeze_mode,
+            "norm_scope": norm_scope,
+            "local_backbone_layer_indices": local_backbone_layer_indices,
+            "strict_trainable_check": strict_trainable_check,
             "trainable_params": trainable_params,
             "frozen_params": frozen_params,
             "moe_layer_indices": moe_layer_indices,
             "dense_baseline": dense_baseline,
+            "optimizer_group_summary": optimizer_group_summary,
+            "optimizer_hparams": optimizer_hparams,
         },
     )
+    if hard_check_issues:
+        raise SystemExit(
+            "Strict trainable checks failed:\n- " + "\n- ".join(hard_check_issues)
+        )
+    if args.preflight_only:
+        append_jsonl(
+            log_path,
+            {
+                "event": "preflight_only_exit",
+                "freeze_mode": freeze_mode,
+                "trainable_params": trainable_params,
+                "frozen_params": frozen_params,
+            },
+        )
+        return
 
     model.to(device)
     model.train()
@@ -230,7 +399,7 @@ def main() -> None:
     max_steps = args.max_steps or training.get("max_steps", 50000)
     grad_accum = args.gradient_accumulation_steps or training.get("gradient_accumulation_steps", 8)
     max_length = training.get("max_length", 2048)
-    learning_rate = training.get("learning_rate", 5e-4)
+    learning_rate = optimizer_hparams["learning_rate"]
     min_lr = training.get("min_lr")
     min_lr_ratio = training.get("min_lr_ratio")
     weight_decay = training.get("weight_decay", 0.01)
@@ -263,12 +432,7 @@ def main() -> None:
             max_samples=max_val_samples,
         )
 
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=learning_rate,
-        weight_decay=weight_decay,
-        betas=(0.9, 0.95),
-    )
+    optimizer = torch.optim.AdamW(optimizer_param_groups, betas=(0.9, 0.95))
 
     if min_lr is not None:
         min_lr_ratio = float(min_lr) / max(float(learning_rate), 1e-12)
@@ -334,6 +498,7 @@ def main() -> None:
 
         if global_step % log_interval == 0 and last_outputs is not None:
             router_metrics = flatten_router_metrics(last_outputs.router_metrics)
+            lr_fields = optimizer_lr_map(optimizer)
             append_jsonl(
                 log_path,
                 {
@@ -342,7 +507,8 @@ def main() -> None:
                     "lm_loss": float(last_outputs.lm_loss.detach().cpu()) if last_outputs.lm_loss is not None else None,
                     "router_aux_loss": float(last_outputs.router_aux_loss.detach().cpu()) if last_outputs.router_aux_loss is not None else None,
                     "grad_norm": float(grad_norm.detach().cpu()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
-                    "lr": scheduler.get_last_lr()[0],
+                    "lr": lr_fields["lr_moe"] if lr_fields["lr_moe"] is not None else scheduler.get_last_lr()[0],
+                    **lr_fields,
                     **router_metrics,
                 },
             )

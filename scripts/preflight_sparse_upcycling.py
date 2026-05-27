@@ -19,8 +19,20 @@ if str(REPO_ROOT) not in sys.path:
 
 from mmfreelm.models.hgrn_bit.modeling_hgrn_bit import HGRNBitForCausalLM
 from mmfreelm.upcycling import ExpertMonitor, StreamingTextDataset, apply_freeze_for_upcycling, upcycle_dense_to_moe
+from mmfreelm.upcycling.param_groups import (
+    build_optimizer_param_groups,
+    resolve_optimizer_hparams,
+    run_strict_trainable_checks,
+)
+from mmfreelm.upcycling.trainable_scope import (
+    infer_freeze_mode,
+    infer_norm_scope,
+    infer_strict_trainable_check,
+    resolve_local_backbone_layer_indices,
+    summarize_trainable_parameters as summarize_trainable_scope,
+)
 from scripts.run_sparse_upcycling import collate_streaming_batch
-from scripts.train_moe_lm import ensure_cuda_device, evaluate, flatten_router_metrics
+from scripts.train_moe_lm import ensure_cuda_device, evaluate, flatten_router_metrics, json_default
 
 
 def parse_args() -> argparse.Namespace:
@@ -287,56 +299,50 @@ def validate_complement_pairs(
     return {"pass": passed, "pairs": pair_results}
 
 
-def summarize_trainable_parameters(model, moe_layer_indices: List[int]) -> Dict[str, object]:
+def summarize_trainable_parameters(
+    model,
+    moe_layer_indices: List[int],
+    freeze_mode: str,
+    local_backbone_layer_indices: List[int],
+    norm_scope: str,
+    trainable_extra_patterns: List[str],
+) -> Dict[str, object]:
+    summary = summarize_trainable_scope(
+        model=model,
+        freeze_mode=freeze_mode,
+        moe_layer_indices=moe_layer_indices,
+        local_backbone_layer_indices=local_backbone_layer_indices,
+        norm_scope=norm_scope,
+        trainable_extra_patterns=trainable_extra_patterns,
+    )
+    by_module_type = summary["trainable_parameter_names_by_module_type"]
+    counts_by_type = summary["trainable_parameter_counts_by_module_type"]
+    norm_names = by_module_type["norm"]
     allowed_mlp_norm_names = {f"model.layers.{layer_idx}.mlp_norm.weight" for layer_idx in moe_layer_indices}
-    router_names: List[str] = []
-    expert_names: List[str] = []
-    mlp_norm_names: List[str] = []
-    output_scale_names: List[str] = []
-    other_names: List[str] = []
-    trainable_names: List[str] = []
-    trainable_norm_names: List[str] = []
-
-    count_by_name = {name: param.numel() for name, param in model.named_parameters()}
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        trainable_names.append(name)
-        if "norm" in name.lower():
-            trainable_norm_names.append(name)
-        if ".mlp.router." in name:
-            router_names.append(name)
-        elif ".mlp.experts." in name:
-            expert_names.append(name)
-        elif name in allowed_mlp_norm_names:
-            mlp_norm_names.append(name)
-        elif name.endswith("pair_log_scales"):
-            output_scale_names.append(name)
-        else:
-            other_names.append(name)
-
-    def total_numel(names: List[str]) -> int:
-        return sum(count_by_name[name] for name in names)
-
+    mlp_norm_names = [name for name in summary["selected_norm_parameter_names"] if name in allowed_mlp_norm_names]
+    other_names = by_module_type["other"]
     return {
-        "trainable_parameter_names": trainable_names,
+        **summary,
         "trainable_parameter_name_summary": {
-            "router": router_names,
-            "experts": expert_names,
+            "router": by_module_type["moe_router"],
+            "experts": by_module_type["moe_experts"],
             "moe_layer_mlp_norm": mlp_norm_names,
-            "learnable_output_scale": output_scale_names,
+            "learnable_output_scale": by_module_type["moe_pair_scales"],
             "other": other_names,
         },
         "trainable_parameter_count_summary": {
-            "router": total_numel(router_names),
-            "experts": total_numel(expert_names),
-            "moe_layer_mlp_norm": total_numel(mlp_norm_names),
-            "learnable_output_scale": total_numel(output_scale_names),
-            "other": total_numel(other_names),
+            "router": counts_by_type["moe_router"],
+            "experts": counts_by_type["moe_experts"],
+            "moe_layer_mlp_norm": sum(
+                next(param.numel() for param_name, param in model.named_parameters() if param_name == name)
+                for name in mlp_norm_names
+            ),
+            "learnable_output_scale": counts_by_type["moe_pair_scales"],
+            "other": counts_by_type["other"],
         },
-        "trainable_rmsnorm_parameter_names": trainable_norm_names,
-        "num_trainable_rmsnorm_parameters": len(trainable_norm_names),
-        "trainable_rmsnorm_parameter_elements": total_numel(trainable_norm_names),
+        "trainable_rmsnorm_parameter_names": norm_names,
+        "num_trainable_rmsnorm_parameters": len(norm_names),
+        "trainable_rmsnorm_parameter_elements": counts_by_type["norm"],
         "trainable_moe_layer_rmsnorm_names": mlp_norm_names,
         "num_trainable_moe_layer_rmsnorm_parameters": len(mlp_norm_names),
         "other_trainable_parameter_names": other_names,
@@ -385,9 +391,13 @@ def main() -> None:
     moe_cfg = config.get("moe", {})
     freeze_cfg = config.get("freeze", {})
     training_cfg = config.get("training", {})
+    dense_baseline = bool(config.get("dense_baseline", False))
     tokenizer_path = args.tokenizer_path or args.pretrained_path
     device = ensure_cuda_device(args.device)
     issues: List[str] = []
+    freeze_mode = infer_freeze_mode(freeze_cfg, dense_baseline=dense_baseline)
+    norm_scope = infer_norm_scope(freeze_cfg, freeze_mode)
+    optimizer_hparams = resolve_optimizer_hparams(config, training_cfg, freeze_cfg, freeze_mode)
 
     if args.run_output_dir is not None:
         checkpoint_best = args.run_output_dir / "checkpoint_best"
@@ -401,6 +411,11 @@ def main() -> None:
     base_model = HGRNBitForCausalLM.from_pretrained(args.pretrained_path, torch_dtype=torch.bfloat16)
     source_model = HGRNBitForCausalLM.from_pretrained(args.pretrained_path, torch_dtype=torch.bfloat16)
     moe_layer_indices = list(moe_cfg.get("layer_indices", list(range(12, 24))))
+    local_backbone_layer_indices = resolve_local_backbone_layer_indices(
+        moe_layer_indices=moe_layer_indices,
+        local_backbone_layer_indices=freeze_cfg.get("local_backbone_layer_indices"),
+    )
+    strict_trainable_check = infer_strict_trainable_check(freeze_cfg, config)
     baseline_hidden = source_model.model.layers[moe_layer_indices[0]].mlp.hidden_size
     baseline_intermediate = source_model.model.layers[moe_layer_indices[0]].mlp.intermediate_size
 
@@ -441,7 +456,45 @@ def main() -> None:
         freeze_non_moe_mlp=freeze_cfg.get("freeze_non_moe_mlp", True),
         freeze_rmsnorm=freeze_cfg.get("freeze_rmsnorm", True),
         trainable_extra_patterns=freeze_cfg.get("trainable_extra_patterns", []),
+        freeze_mode=freeze_mode,
+        local_backbone_layer_indices=local_backbone_layer_indices,
+        norm_scope=norm_scope,
+        dense_baseline=dense_baseline,
     )
+    trainable_summary = summarize_trainable_parameters(
+        model,
+        moe_layer_indices,
+        freeze_mode=freeze_mode,
+        local_backbone_layer_indices=local_backbone_layer_indices,
+        norm_scope=norm_scope,
+        trainable_extra_patterns=freeze_cfg.get("trainable_extra_patterns", []),
+    )
+    _, optimizer_group_summary = build_optimizer_param_groups(
+        model=model,
+        freeze_mode=freeze_mode,
+        moe_lr=optimizer_hparams["moe_lr"],
+        backbone_lr=optimizer_hparams["backbone_lr"],
+        norm_lr=optimizer_hparams["norm_lr"],
+        embed_lr=optimizer_hparams["embed_lr"],
+        weight_decay=optimizer_hparams["weight_decay"],
+        local_backbone_layer_indices=local_backbone_layer_indices,
+    )
+    if strict_trainable_check:
+        issues.extend(
+            run_strict_trainable_checks(
+                trainable_summary=trainable_summary,
+                optimizer_group_summary=optimizer_group_summary,
+                freeze_mode=freeze_mode,
+                freeze_embeddings=freeze_cfg.get("freeze_embeddings", True),
+                freeze_lm_head=freeze_cfg.get("freeze_lm_head", True),
+                local_backbone_layer_indices=local_backbone_layer_indices,
+            )
+        )
+    warnings: List[str] = []
+    if trainable_summary["extra_pattern_enabled_parameter_count"] > 32:
+        warnings.append(
+            "trainable_extra_patterns enabled more than 32 additional parameters; verify that scope expansion is intended."
+        )
     model = model.to(device)
 
     dataloader = build_loader(
@@ -455,7 +508,6 @@ def main() -> None:
     eval_args = build_eval_args(training_cfg.get("precision", "bf16"), training_cfg.get("max_eval_batches", 64))
     init_eval_metrics = evaluate(model, dataloader, device, eval_args)
 
-    trainable_summary = summarize_trainable_parameters(model, moe_layer_indices)
     layers: Dict[str, object] = {}
     zero_ratio_values = []
     for layer_idx in moe_layer_indices:
@@ -481,10 +533,6 @@ def main() -> None:
     zero_ratio_avg = float(torch.tensor(zero_ratio_values, dtype=torch.float32).mean().item())
     if zero_ratio_avg > 0.50 or zero_ratio_avg < 0.20:
         issues.append(f"Ternary zero ratio out of expected range: {zero_ratio_avg:.4f}")
-
-    other_trainables = trainable_summary["other_trainable_parameter_names"]
-    if other_trainables:
-        issues.append(f"Unexpected trainable parameters outside router/experts/mlp_norm/output_scale: {other_trainables}")
 
     trainable_mlp_norm_names = set(trainable_summary["trainable_moe_layer_rmsnorm_names"])
     expected_mlp_norm_names = {f"model.layers.{layer_idx}.mlp_norm.weight" for layer_idx in moe_layer_indices}
@@ -625,6 +673,12 @@ def main() -> None:
         num_experts_per_tok=moe_cfg.get("num_experts_per_tok", 2),
     )
     payload: Dict[str, object] = {
+        "freeze_mode": freeze_mode,
+        "norm_scope": norm_scope,
+        "strict_trainable_check": strict_trainable_check,
+        "warnings": warnings,
+        "optimizer_hparams": optimizer_hparams,
+        "optimizer_group_summary": optimizer_group_summary,
         "experiment": config.get("experiment_name"),
         "config_path": str(args.config_path),
         "pretrained_path": args.pretrained_path,
@@ -700,6 +754,19 @@ def main() -> None:
     payload["pass"] = len(issues) == 0
     payload["issues"] = issues
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
+    trainable_names_path = args.output_path.parent / "trainable_param_names.txt"
+    trainable_names_path.write_text(
+        "\n".join(trainable_summary["trainable_parameter_names"]) + ("\n" if trainable_summary["trainable_parameter_names"] else ""),
+        encoding="utf-8",
+    )
+    (args.output_path.parent / "trainable_param_summary.json").write_text(
+        json.dumps(trainable_summary, ensure_ascii=False, indent=2, default=json_default) + "\n",
+        encoding="utf-8",
+    )
+    (args.output_path.parent / "optimizer_param_groups.json").write_text(
+        json.dumps(optimizer_group_summary, ensure_ascii=False, indent=2, default=json_default) + "\n",
+        encoding="utf-8",
+    )
     args.output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
