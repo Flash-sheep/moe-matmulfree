@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="/home/yjl/a100-r760/matmulfreellm"
-CONDA_ROOT="/home/yjl/anaconda3"
-CONDA_ENV_PREFIX="/home/yjl/conda_envs/matmulfreellm_runtime"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+STORAGE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
+CONDA_ROOT="${CONDA_ROOT:-/home/yjl/anaconda3}"
+CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-/home/yjl/conda_envs/matmulfreellm_runtime}"
 
 if [ ! -f "${CONDA_ROOT}/etc/profile.d/conda.sh" ]; then
   echo "Missing conda initialization script: ${CONDA_ROOT}/etc/profile.d/conda.sh" >&2
@@ -15,9 +17,9 @@ conda activate "${CONDA_ENV_PREFIX}"
 
 # Keep the project environment isolated from user-site packages.
 export PYTHONNOUSERSITE=1
-export HF_HOME="/home/data/yjl/hf_home"
-export TRANSFORMERS_CACHE="/home/data/yjl/hf_home/transformers"
-export HF_DATASETS_CACHE="/home/data/yjl/hf_home/datasets"
+export HF_HOME="${STORAGE_ROOT}/hf_home"
+export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
+export HF_DATASETS_CACHE="${HF_HOME}/datasets"
 
 cd "${REPO_ROOT}"
 

@@ -18,7 +18,7 @@ from mmfreelm.upcycling.expert_monitor import ExpertMonitor
 from mmfreelm.upcycling.sparse_upcycling import upcycle_dense_to_moe
 
 
-CHECKPOINT_PATH = "/home/yjl/yjl-r760/matmulfreellm_assets/checkpoints/MMfreeLM-370M"
+CHECKPOINT_PATH = str(REPO_ROOT / "checkpoints" / "MMfreeLM-370M")
 OUTPUT_PATH = REPO_ROOT / "outputs" / "svd_init_verification.json"
 MOE_LAYERS = list(range(12, 24))
 NUM_EXPERTS = 4

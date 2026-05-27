@@ -2,49 +2,52 @@
 
 ## Large-file storage
 
-The project worktree remains in:
+This repository is expected to live under a movable storage root, for example:
 
-- `/home/yjl/a100-r760/matmulfreellm`
+- `/home/storage/yjl/moe-matmulfree`
 
-Large files are stored under:
+Large-file assets should live in the sibling directory:
 
-- `/home/data/yjl/matmulfreellm_assets/checkpoints`
-- `/home/data/yjl/matmulfreellm_assets/data`
-- `/home/data/yjl/matmulfreellm_assets/outputs`
+- `../matmulfreellm_assets/checkpoints`
+- `../matmulfreellm_assets/data`
+- `../matmulfreellm_assets/datasets`
+- `../matmulfreellm_assets/outputs`
 
-The worktree paths below are symlinks into `/home/data/yjl`:
+The worktree paths below should be symlinks into that sibling assets directory:
 
-- `checkpoints`
-- `data`
-- `outputs`
+- `checkpoints -> ../matmulfreellm_assets/checkpoints`
+- `data -> ../matmulfreellm_assets/data`
+- `datasets -> ../matmulfreellm_assets/datasets`
+- `outputs -> ../matmulfreellm_assets/outputs`
 
-As long as training and export scripts keep writing into those repo-relative paths, checkpoints and model weights will land under `/home/data/yjl`.
+As long as training and export scripts keep writing into those repo-relative paths, checkpoints and model weights will land under the mounted assets directory rather than a machine-specific absolute path.
 
 ## Conda runtime
 
 The Conda environment prefix is:
 
-- `/home/yjl/conda_envs/matmulfreellm_runtime`
+- `${CONDA_ENV_PREFIX:-/home/yjl/conda_envs/matmulfreellm_runtime}`
 
 Project-local reference:
 
-- `/home/yjl/a100-r760/matmulfreellm/.conda_runtime_env`
+- `./.conda_runtime_env`
 
 Activation helper:
 
-- `/home/yjl/a100-r760/matmulfreellm/scripts/activate_conda_runtime.sh`
+- `./scripts/activate_conda_runtime.sh`
 
 Usage:
 
 ```bash
-source /home/yjl/a100-r760/matmulfreellm/scripts/activate_conda_runtime.sh
+source ./scripts/activate_conda_runtime.sh
 ```
 
 That helper:
 
 - activates the Conda environment
 - sets `PYTHONNOUSERSITE=1`
-- pins Hugging Face caches to `/home/data/yjl/hf_home`
+- pins Hugging Face caches to the sibling `../hf_home`
+- allows overriding `CONDA_ROOT` / `CONDA_ENV_PREFIX` through environment variables
 - prints the resolved asset directories
 
 ## Current state
@@ -54,6 +57,6 @@ The Conda environment itself has been created, but GPU runtime packages may stil
 Recommended verification command:
 
 ```bash
-source /home/yjl/a100-r760/matmulfreellm/scripts/activate_conda_runtime.sh
+source ./scripts/activate_conda_runtime.sh
 python -c "import torch, transformers, mmfreelm; print(torch.__version__, transformers.__version__)"
 ```

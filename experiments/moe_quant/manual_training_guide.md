@@ -75,7 +75,7 @@ Do not start the ternary-expert run until the floating-point MoE run is stable.
 ### Dense baseline
 
 ```bash
-cd /home/yjl/matmulfreellm
+cd /path/to/moe-matmulfree
 python3 scripts/train_moe_lm.py \
   --config-file experiments/moe_quant/configs/dense_fp_baseline.json \
   --tokenizer YOUR_TOKENIZER \
@@ -87,7 +87,7 @@ python3 scripts/train_moe_lm.py \
 ### Floating-point MoE baseline
 
 ```bash
-cd /home/yjl/matmulfreellm
+cd /path/to/moe-matmulfree
 python3 scripts/train_moe_lm.py \
   --config-file experiments/moe_quant/configs/fp_moe_baseline.json \
   --tokenizer YOUR_TOKENIZER \
@@ -99,7 +99,7 @@ python3 scripts/train_moe_lm.py \
 ### Ternary-expert MoE baseline
 
 ```bash
-cd /home/yjl/matmulfreellm
+cd /path/to/moe-matmulfree
 python3 scripts/train_moe_lm.py \
   --config-file experiments/moe_quant/configs/ternary_expert_moe_baseline.json \
   --tokenizer YOUR_TOKENIZER \
