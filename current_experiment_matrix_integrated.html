@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Current Experiment Matrix</title>
+<style>
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px;line-height:1.5;color:#111;background:#fafafa;}
+h1,h2{margin:0 0 12px 0;} h2{margin-top:28px;}
+.card{background:#fff;border:1px solid #ddd;border-radius:12px;padding:20px;margin-bottom:20px;box-shadow:0 1px 2px rgba(0,0,0,.04);}
+table{border-collapse:collapse;width:100%;font-size:13px;background:#fff;}
+th,td{border:1px solid #ddd;padding:8px 10px;vertical-align:top;text-align:left;}
+th{background:#f3f4f6;position:sticky;top:0;}
+.table-wrap{overflow:auto;max-height:75vh;border:1px solid #ddd;border-radius:12px;background:#fff;}
+code{background:#f3f4f6;padding:1px 4px;border-radius:4px;}
+ul{margin:8px 0 0 18px;padding:0;}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Current Experiment Matrix</h1>
+<p>Auto-generated from <code>current_experiment_matrix.json</code>.</p>
+</div>
+<div class="card">
+<h2>Evaluation Convention</h2>
+<ul>
+<li><strong>val_ppl_64</strong>: for rows refreshed on or after 2026-05-25, loaded checkpoint evaluated with batch_size=4 and max_samples=256 on SlimPajama validation; older untouched historical rows may still reflect pre-refresh values</li>
+<li><strong>val_ppl_1024</strong>: loaded checkpoint evaluated on 1024 validation samples when available</li>
+</ul>
+</div>
+<div class="card">
+<h2>Key Conclusions</h2>
+<ul>
+<li><strong>best_capacity_fair_completed_config</strong>: partition 4e capacity-fair 5k</li>
+<li><strong>best_overall_historical_config</strong>: copy+noise 4e full 20k</li>
+<li><strong>best_non_moe_reference</strong>: non-moe baseline</li>
+<li><strong>partition_8e_vs_partition_4e_5k</strong>: worse on both 64-batch and 1024-sample evaluation despite healthy routing and strong expert separation</li>
+<li><strong>partition_4e_20k_current_status</strong>: substantially improved over partition 4e 5k and close to the non-moe baseline by step 18000, but the run did not finish to 20000 step</li>
+<li><strong>copy_noise_4e_full_top1_5k_takeaway</strong>: top-1 active-path-fair full-width routing improves dramatically over top-2 full-width at the same noise setting, but still remains above the non-moe baseline on stable 1024-sample evaluation</li>
+<li><strong>complement_pair_6e_half_top2_5k_takeaway</strong>: under the unified reevaluation protocol, the complement-pair design preserves healthy ternary statistics, achieves much stronger specialization than full-copy noise baselines, and is effectively tied with the non-moe baseline: slightly worse at PPL@64 and slightly better at PPL@1024</li>
+<li><strong>relaxed_complement_coverage_5k_takeaway</strong>: allowing all 15 top-2 pairs with a fixed coverage penalty does not improve the 6E half-width design at 5K; the model still uses only the three strict complement pairs and ends up slightly worse than the standard aux=0.0001 baseline at PPL@1024</li>
+<li><strong>pair_plus_free_top3_5k_takeaway</strong>: adding one free expert on top of the strict complement base pair improves 5K perplexity materially over the standard 6E half-width baseline, but the gain comes from extra active compute at 1.5I and still does not approach the best scratch 20K complement-pair result</li>
+<li><strong>mainline_reeval_20260525_scope</strong>: the non-moe baseline and main active-path-fair rows except virtual-group 8e half 20k were refreshed on 2026-05-25 with the current eval protocol; that virtual-group row remains historical because its output directory is unavailable</li>
+<li><strong>continued_finetune_10k_takeaway</strong>: continuing from the best aux=0.0001 20K checkpoint with fresh optimizer/scheduler and selective low-lr backbone unfreezing yields only marginal additional gains; partial full fine-tune improves PPL@1024 by about 0.007, while local token-mixer+norm fine-tune is nearly tied with the base 20K checkpoint.</li>
+</ul>
+</div>
+<div class="card">
+<h2>Summary</h2>
+<ul>
+<li><strong>copy_noise_4e_full_top1_20k_takeaway</strong>: training from scratch to 20k substantially improves over the 5k top-1 variant and now very slightly beats the non-moe baseline on both 64-batch and 1024-sample evaluation, but expert similarity remains very high.</li>
+<li><strong>complement_pair_6e_half_top2_20k_takeaway</strong>: the complement-pair design continues to improve with longer training and now clearly beats the non-moe baseline on both 64-batch and 1024-sample evaluation while preserving moderate specialization and healthy ternary statistics.</li>
+<li><strong>complement_pair_6e_half_top2_aux0001_20k_takeaway</strong>: lowering router aux to 0.0001 and training from scratch to 20k yields the strongest complement-pair result so far, improving over the earlier aux=0.005 20k run without harming load balance.</li>
+<li><strong>complement_pair_6e_half_top2_aux0001_layers6_23_5k_takeaway</strong>: expanding MoE coverage to layers 6-23 increases parameter count but does not outperform the standard layer12-23 5k configuration, so depth expansion looks lower priority than staying on the 12-layer template.</li>
+<li><strong>relaxed_vs_pairfree_5k_takeaway</strong>: among the two aggressive routing ablations, relaxed top-2 with coverage penalty fails to unlock new useful paths, while pair-plus-free top-3 is the only one that produces a clear 5K gain; that makes extra active compute look more promising than simply relaxing the pair constraint.</li>
+<li><strong>continued_finetune_10k_priority</strong>: if continuation-style follow-up is pursued, partial full fine-tune ranks above local token-mixer+norm, but both gains are too small to justify treating continuation as a new mainline over the scratch 20K complement-pair baseline.</li>
+</ul>
+</div>
+<div class="card">
+<h2>Rows</h2>
+<div class="table-wrap">
+<table>
+<thead><tr>
+<th>config</th>
+<th>family</th>
+<th>capacity_fair</th>
+<th>status</th>
+<th>params_total</th>
+<th>experts</th>
+<th>init</th>
+<th>steps</th>
+<th>val_ppl_64</th>
+<th>val_ppl_1024</th>
+<th>expert_similarity</th>
+<th>router_entropy</th>
+<th>zero_ratio_avg</th>
+<th>notes</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>non-moe baseline</td>
+<td>non_moe</td>
+<td>yes</td>
+<td>complete</td>
+<td>374108160</td>
+<td>0</td>
+<td>n/a</td>
+<td>pretrained</td>
+<td>17.214063</td>
+<td>17.294129</td>
+<td>n/a</td>
+<td>n/a</td>
+<td>n/a</td>
+<td>reference baseline; refreshed with the current unified eval protocol on 2026-05-25</td>
+</tr>
+<tr>
+<td>copy+noise 4e full 5k</td>
+<td>full_capacity</td>
+<td>no</td>
+<td>complete</td>
+<td>685722624</td>
+<td>4</td>
+<td>copy_noise</td>
+<td>5000</td>
+<td>26.403462</td>
+<td>n/a</td>
+<td>0.955469</td>
+<td>1.1478</td>
+<td>n/a</td>
+<td>historical ternary full-width</td>
+</tr>
+<tr>
+<td>fp expert 4e full 5k</td>
+<td>full_capacity</td>
+<td>no</td>
+<td>complete</td>
+<td>n/a</td>
+<td>4</td>
+<td>copy_noise_fp</td>
+<td>5000</td>
+<td>32.527758</td>
+<td>n/a</td>
+<td>0.968334</td>
+<td>0.559271</td>
+<td>n/a</td>
+<td>historical FP expert control</td>
+</tr>
+<tr>
+<td>copy+noise 8e full 5k</td>
+<td>full_capacity</td>
+<td>no</td>
+<td>complete</td>
+<td>n/a</td>
+<td>8</td>
+<td>copy_noise</td>
+<td>5000</td>
+<td>15.80063</td>
+<td>n/a</td>
+<td>0.974421</td>
+<td>1.981064</td>
+<td>n/a</td>
+<td>historical full-width 8e reference</td>
+</tr>
+<tr>
+<td>copy+noise 4e full 20k</td>
+<td>full_capacity</td>
+<td>no</td>
+<td>complete</td>
+<td>n/a</td>
+<td>4</td>
+<td>copy_noise</td>
+<td>20000</td>
+<td>15.304246</td>
+<td>n/a</td>
+<td>0.963569</td>
+<td>1.287916</td>
+<td>n/a</td>
+<td>historical full-width 20k reference</td>
+</tr>
+<tr>
+<td>svd 4e half 5k</td>
+<td>capacity_reduced</td>
+<td>no</td>
+<td>complete</td>
+<td>478036992</td>
+<td>4</td>
+<td>svd_orthogonal</td>
+<td>5000</td>
+<td>25.982806</td>
+<td>27.998048</td>
+<td>0.005124</td>
+<td>0.748778</td>
+<td>83</td>
+<td>orthogonal but ternary distribution abnormal</td>
+</tr>
+<tr>
+<td>partition 4e capacity-fair 5k</td>
+<td>partition_capacity_fair</td>
+<td>yes</td>
+<td>complete</td>
+<td>374194176</td>
+<td>4</td>
+<td>partition</td>
+<td>5000</td>
+<td>17.593521</td>
+<td>18.99083</td>
+<td>0.011571</td>
+<td>1.325666</td>
+<td>37.137862</td>
+<td>current 4e fair reference</td>
+</tr>
+<tr>
+<td>partition 8e capacity-fair 5k</td>
+<td>partition_capacity_fair</td>
+<td>yes</td>
+<td>complete</td>
+<td>374292480</td>
+<td>8</td>
+<td>partition</td>
+<td>5000</td>
+<td>19.087302</td>
+<td>20.569888</td>
+<td>0.011701</td>
+<td>1.905332</td>
+<td>37.127139</td>
+<td>new 8e fair result</td>
+</tr>
+<tr>
+<td>partition 4e capacity-fair 20k</td>
+<td>partition_capacity_fair</td>
+<td>yes</td>
+<td>incomplete_at_step_18650_best_ckpt_step_18000</td>
+<td>374194176</td>
+<td>4</td>
+<td>partition</td>
+<td>20000</td>
+<td>16.940515</td>
+<td>18.297932</td>
+<td>0.012038</td>
+<td>1.315502</td>
+<td>37.137862</td>
+<td>current run stopped before 20k; best checkpoint is step 18000</td>
+</tr>
+<tr>
+<td>noise alpha=0.30 4e full 20k</td>
+<td>full_capacity</td>
+<td>no</td>
+<td>complete</td>
+<td>685722624</td>
+<td>4</td>
+<td>copy_noise_relative_std_alpha030</td>
+<td>20000</td>
+<td>15.98708</td>
+<td>17.324066</td>
+<td>0.915107</td>
+<td>1.304991</td>
+<td>36.581286</td>
+<td>stronger copy-noise ablation; near non-moe baseline at 64-batch eval but still slightly worse at 1024-sample eval</td>
+</tr>
+<tr>
+<td>virtual-group 8e half 20k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>685820928</td>
+<td>8</td>
+<td>virtual_group_partition_copy_noise</td>
+<td>20000</td>
+<td>16.154311</td>
+<td>17.50885</td>
+<td>0.423367</td>
+<td>1.999947</td>
+<td>36.809455</td>
+<td>grouped virtual-path active-fair design; historical row not refreshed on 2026-05-25 because the original output directory is currently unavailable</td>
+</tr>
+<tr>
+<td>copy+noise 4e full top1 5k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>685722624</td>
+<td>4</td>
+<td>copy_noise_relative_std_alpha030_top1</td>
+<td>5000</td>
+<td>17.752278</td>
+<td>17.830492</td>
+<td>0.918316</td>
+<td>1.378419</td>
+<td>36.24132</td>
+<td>top-1 full-width active-path-fair variant; much closer than top-2 full-width, but still above non-moe baseline on stable eval</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top2 5k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>581928960</td>
+<td>6</td>
+<td>complement_pair_6e</td>
+<td>5000</td>
+<td>17.216577</td>
+<td>17.291107</td>
+<td>0.272492</td>
+<td>1.628752</td>
+<td>37.068012</td>
+<td>complement-pair half-width active-path-fair design; under the unified reevaluation protocol it is essentially tied with the non-moe baseline, landing slightly worse at PPL@64 and slightly better at PPL@1024</td>
+</tr>
+<tr>
+<td>complement-copy 12e half top2 5k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>893604864</td>
+<td>12</td>
+<td>complement_copy_12e</td>
+<td>5000</td>
+<td>17.346666</td>
+<td>17.407771</td>
+<td>0.337824</td>
+<td>2.27366</td>
+<td>37.065861</td>
+<td>12 legal complement-copy paths increase routing freedom, but 5K training underperforms 6E complement and non-moe baseline.</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top2 aux=0.001 5k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>581928960</td>
+<td>6</td>
+<td>complement_pair_6e</td>
+<td>5000</td>
+<td>17.079334</td>
+<td>17.154982</td>
+<td>0.272489</td>
+<td>1.661198</td>
+<td>37.067938</td>
+<td>Lowering aux from 0.005 to 0.001 improves 5K perplexity while keeping complement routing stable and balanced.</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top2 aux=0.0005 5k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>581928960</td>
+<td>6</td>
+<td>complement_pair_6e</td>
+<td>5000</td>
+<td>17.066421</td>
+<td>17.136918</td>
+<td>0.272484</td>
+<td>1.687872</td>
+<td>37.066761</td>
+<td>Slightly better than aux=0.001 at 5K; pair usage remains near-uniform with no collapse.</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top2 aux=0.0001 5k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>581928960</td>
+<td>6</td>
+<td>complement_pair_6e</td>
+<td>5000</td>
+<td>17.038169</td>
+<td>17.115947</td>
+<td>0.272485</td>
+<td>1.734625</td>
+<td>37.067583</td>
+<td>Best 5K complement-pair result among tested aux values; lower aux improves PPL but does not induce stronger pair specialization.</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top2 aux=0.00005 5k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>581928960</td>
+<td>6</td>
+<td>complement_pair_6e</td>
+<td>5000</td>
+<td>17.039069</td>
+<td>17.112539</td>
+<td>0.272483</td>
+<td>1.741368</td>
+<td>37.068343</td>
+<td>Slightly behind aux=0.0001 on 64-batch eval but best on 1024-sample eval; very small aux keeps routing stable without changing specialization materially.</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top2 aux=0.0001 layers6-23 5k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>685839360</td>
+<td>6</td>
+<td>complement_pair_6e</td>
+<td>5000</td>
+<td>17.153451</td>
+<td>17.231831</td>
+<td>0.272888</td>
+<td>1.735921</td>
+<td>36.695176</td>
+<td>Expanding MoE replacement from layers 12-23 to 6-23 increases total and trainable params, but the 5K result is worse than the standard 12-layer aux=0.0001 run.</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top2 aux=0.0001 unfreeze moe-norm 5k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>581928960</td>
+<td>6</td>
+<td>complement_pair_6e</td>
+<td>5000</td>
+<td>17.052209</td>
+<td>17.113202</td>
+<td>0.272481</td>
+<td>1.735133</td>
+<td>37.068233</td>
+<td>Only unfreezes layer12-23 mlp_norm around the MoE blocks. Under the unified reevaluation protocol it is effectively tied with the fixed-norm aux=0.0001 5K baseline: slightly worse at PPL@64 and slightly better at PPL@1024.</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top2 aux=0.0001 learnable pair-scale 5k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>581928996</td>
+<td>6</td>
+<td>complement_pair_6e</td>
+<td>5000</td>
+<td>17.057327</td>
+<td>17.119282</td>
+<td>0.272543</td>
+<td>1.735625</td>
+<td>37.064409</td>
+<td>Adds 36 positive log-scale parameters for per-layer/per-pair output scaling. Learned scales drift below 2.0 (mean 1.819, min 1.721, max 1.890) but remain slightly worse than the fixed-scale aux=0.0001 5K baseline under the unified reevaluation protocol.</td>
+</tr>
+<tr>
+<td>relaxed complement 6e half top2 coverage-penalty 5k</td>
+<td>active_path_fair</td>
+<td>yes</td>
+<td>complete</td>
+<td>581928960</td>
+<td>6</td>
+<td>complement_pair_6e</td>
+<td>5000</td>
+<td>17.04987</td>
+<td>17.122965</td>
+<td>0.27249</td>
+<td>1.735686</td>
+<td>37.066361</td>
+<td>Allows all 15 top-2 pairs but scores them with a fixed coverage-penalty lambda=2.0. In practice it collapses back to the three strict complement pairs, so routing freedom does not translate into better PPL.</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top3 pair+free 5k</td>
+<td>active_compute_scaled</td>
+<td>no</td>
+<td>complete</td>
+<td>581928960</td>
+<td>6</td>
+<td>complement_pair_6e</td>
+<td>5000</td>
+<td>16.980631</td>
+<td>17.055005</td>
+<td>0.272554</td>
+<td>1.782744</td>
+<td>37.067249</td>
+<td>Uses a strict complement base pair plus one extra free expert with free_expert_scale=0.5, raising active width to 1.5I. It is clearly better than the standard 6E 5K baseline, but still behind the best scratch 20K complement-pair run.</td>
+</tr>
+<tr>
+<td>copy+noise 4e full top1 20k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>685722624</td>
+<td>4</td>
+<td>copy_noise_relative_std</td>
+<td>20000</td>
+<td>17.13486</td>
+<td>17.226221</td>
+<td>0.915913</td>
+<td>1.38378</td>
+<td>36.538228</td>
+<td>full-width top-1 active-path-fair variant trained from scratch to 20k; healthy load balance but expert similarity remains high</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top2 aux=0.005 20k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>581928960</td>
+<td>6</td>
+<td>complement_pair_6e</td>
+<td>20000</td>
+<td>16.814644</td>
+<td>16.896687</td>
+<td>0.268439</td>
+<td>1.641286</td>
+<td>36.968832</td>
+<td>First scratch 20K complement-pair run; strong specialization and clear gains over non-MoE, though later aux=0.0001 20K improves further.</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top2 aux=0.0001 20k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>581928960</td>
+<td>6</td>
+<td>complement_pair_6e</td>
+<td>20000</td>
+<td>16.726043</td>
+<td>16.813868</td>
+<td>0.268614</td>
+<td>1.767488</td>
+<td>37.065324</td>
+<td>Scratch 20K extension of the best 5K aux=0.0001 setting; best complement-pair result so far, beating the earlier aux=0.005 20K run on both eval conventions.</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top2 aux=0.0001 20k partial-full-ft 10k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>581928960</td>
+<td>6</td>
+<td>moe_checkpoint_continued</td>
+<td>20k+10k continued</td>
+<td>16.723642</td>
+<td>16.806802</td>
+<td>0.268614</td>
+<td>1.767444</td>
+<td>36.979246</td>
+<td>Continue from the best aux=0.0001 20K checkpoint with model-weight-only init, keep MoE lr=1e-4, and unfreeze the full transformer backbone at lr=1e-5 while keeping embeddings and lm_head frozen. Improves PPL@1024 by about 0.007 over the base 20K checkpoint.</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top2 aux=0.0001 20k local-tm-norm-ft 10k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>581928960</td>
+<td>6</td>
+<td>moe_checkpoint_continued</td>
+<td>20k+10k continued</td>
+<td>16.724637</td>
+<td>16.811282</td>
+<td>0.268614</td>
+<td>1.767534</td>
+<td>36.979246</td>
+<td>Continue from the same best 20K checkpoint, but only unfreeze layer12-23 attn and norm parameters at lr=1e-5. Slightly improves PPL@1024 over the base 20K checkpoint, but the gain is extremely small.</td>
+</tr>
+<tr>
+<td>complement-pair 6e half top2 aux=0.0001 init-local-backbone-ft 20k</td>
+<td>active_path_fair</td>
+<td>no</td>
+<td>complete</td>
+<td>581928960</td>
+<td>6</td>
+<td>dense_checkpoint_local_backbone_ft</td>
+<td>20000</td>
+<td>16.830903</td>
+<td>16.904561</td>
+<td>0.273919</td>
+<td>1.594669</td>
+<td>18.851096</td>
+<td>Initialized from the dense MMfreeLM-370M checkpoint, upcycled into 6E complement-pair MoE, and jointly trained MoE plus layer12-23 local backbone for 20K steps. Training was stable and load balance stayed nearly uniform, but final PPL@1024 is clearly worse than the best scratch aux=0.0001 20K complement-pair run.</td>
+</tr>
+</tbody></table></div></div>
+</body></html>

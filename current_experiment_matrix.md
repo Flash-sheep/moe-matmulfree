@@ -1,67 +1,40 @@
 # Current Experiment Matrix
 
-本文档用于维护当前 sparse upcycling 实验的横向对照矩阵，优先记录已经完成统一评测的实验。
+| Config | Family | Fair | Status | Params | Experts | Steps | PPL@64 | PPL@1024 | Sim | RouterH | Zero% | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| non-moe baseline | non_moe | yes | complete | 374108160 | 0 | pretrained | 17.214 | 17.294 | n/a | n/a | n/a | reference baseline; refreshed with the current unified eval protocol on 2026-05-25 |
+| copy+noise 4e full 5k | full_capacity | no | complete | 685722624 | 4 | 5000 | 26.403 | n/a | 0.955469 | 1.148 | n/a | historical ternary full-width |
+| fp expert 4e full 5k | full_capacity | no | complete | n/a | 4 | 5000 | 32.528 | n/a | 0.968334 | 0.559 | n/a | historical FP expert control |
+| copy+noise 8e full 5k | full_capacity | no | complete | n/a | 8 | 5000 | 15.801 | n/a | 0.974421 | 1.981 | n/a | historical full-width 8e reference |
+| copy+noise 4e full 20k | full_capacity | no | complete | n/a | 4 | 20000 | 15.304 | n/a | 0.963569 | 1.288 | n/a | historical full-width 20k reference |
+| svd 4e half 5k | capacity_reduced | no | complete | 478036992 | 4 | 5000 | 25.983 | 27.998 | 0.005124 | 0.749 | 83.000 | orthogonal but ternary distribution abnormal |
+| partition 4e capacity-fair 5k | partition_capacity_fair | yes | complete | 374194176 | 4 | 5000 | 17.594 | 18.991 | 0.011571 | 1.326 | 37.138 | current 4e fair reference |
+| partition 8e capacity-fair 5k | partition_capacity_fair | yes | complete | 374292480 | 8 | 5000 | 19.087 | 20.570 | 0.011701 | 1.905 | 37.127 | new 8e fair result |
+| partition 4e capacity-fair 20k | partition_capacity_fair | yes | incomplete_at_step_18650_best_ckpt_step_18000 | 374194176 | 4 | 20000 | 16.941 | 18.298 | 0.012038 | 1.316 | 37.138 | current run stopped before 20k; best checkpoint is step 18000 |
+| noise alpha=0.30 4e full 20k | full_capacity | no | complete | 685722624 | 4 | 20000 | 15.987 | 17.324 | 0.915107 | 1.305 | 36.581 | stronger copy-noise ablation; near non-moe baseline at 64-batch eval but still slightly worse at 1024-sample eval |
+| virtual-group 8e half 20k | active_path_fair | no | complete | 685820928 | 8 | 20000 | 16.154 | 17.509 | 0.423367 | 2.000 | 36.809 | Historical row not refreshed on 2026-05-25 because the original output directory is currently unavailable. |
+| copy+noise 4e full top1 5k | active_path_fair | no | complete | 685722624 | 4 | 5000 | 17.752 | 17.830 | 0.918316 | 1.378 | 36.241 | top-1 full-width active-path-fair variant; much closer than top-2 full-width, but still above non-moe baseline on stable eval |
+| complement-pair 6e half top2 5k | active_path_fair | no | complete | 581928960 | 6 | 5000 | 17.217 | 17.291 | 0.272492 | 1.629 | 37.068 | complement-pair half-width active-path-fair design; under the unified reevaluation protocol it is essentially tied with the non-moe baseline, slightly worse at PPL@64 and slightly better at PPL@1024. |
+| complement-copy 12e half top2 5k | active_path_fair | no | complete | 893604864 | 12 | 5000 | 17.347 | 17.408 | 0.337824 | 2.274 | 37.066 | 12 legal complement-copy paths increase routing freedom, but 5K training underperforms 6E complement and non-moe baseline. |
+| complement-pair 6e half top2 aux=0.001 5k | active_path_fair | no | complete | 581928960 | 6 | 5000 | 17.079 | 17.155 | 0.272489 | 1.661 | 37.068 | Lowering aux from 0.005 to 0.001 improves 5K perplexity while keeping complement routing stable and balanced. |
+| complement-pair 6e half top2 aux=0.0005 5k | active_path_fair | no | complete | 581928960 | 6 | 5000 | 17.066 | 17.137 | 0.272484 | 1.688 | 37.067 | Slightly better than aux=0.001 at 5K; pair usage remains near-uniform with no collapse. |
+| complement-pair 6e half top2 aux=0.0001 5k | active_path_fair | no | complete | 581928960 | 6 | 5000 | 17.038 | 17.116 | 0.272485 | 1.735 | 37.068 | Best 5K complement-pair result among tested aux values; lower aux improves PPL but does not induce stronger pair specialization. |
+| complement-pair 6e half top2 aux=0.00005 5k | active_path_fair | no | complete | 581928960 | 6 | 5000 | 17.039 | 17.113 | 0.272483 | 1.741 | 37.068 | Slightly behind aux=0.0001 on 64-batch eval but best on 1024-sample eval; very small aux keeps routing stable without changing specialization materially. |
+| complement-pair 6e half top2 aux=0.0001 layers6-23 5k | active_path_fair | no | complete | 685839360 | 6 | 5000 | 17.153 | 17.232 | 0.272888 | 1.736 | 36.695 | Expanding MoE replacement from layers 12-23 to 6-23 increases total and trainable params, but the 5K result is worse than the standard 12-layer aux=0.0001 run. |
+| complement-pair 6e half top2 aux=0.0001 unfreeze moe-norm 5k | active_path_fair | no | complete | 581928960 | 6 | 5000 | 17.052 | 17.113 | 0.272481 | 1.735 | 37.068 | Only unfreezes layer12-23 `mlp_norm` around the MoE blocks. Under the unified reevaluation protocol it is effectively tied with the fixed-norm aux=0.0001 5K baseline: slightly worse at PPL@64 and slightly better at PPL@1024. |
+| complement-pair 6e half top2 aux=0.0001 learnable pair-scale 5k | active_path_fair | no | complete | 581928996 | 6 | 5000 | 17.057 | 17.119 | 0.272543 | 1.736 | 37.064 | Adds 36 positive log-scale parameters for per-layer/per-pair output scaling. Learned scales drift below 2.0 but remain slightly worse than the fixed-scale aux=0.0001 5K baseline under the unified reevaluation protocol. |
+| relaxed complement 6e half top2 coverage-penalty 5k | active_path_fair | yes | complete | 581928960 | 6 | 5000 | 17.050 | 17.123 | 0.272490 | 1.736 | 37.066 | Allows all 15 top-2 pairs but scores them with a fixed coverage-penalty lambda=2.0. In practice it collapses back to the three strict complement pairs, so routing freedom does not translate into better PPL. |
+| complement-pair 6e half top3 pair+free 5k | active_compute_scaled | no | complete | 581928960 | 6 | 5000 | 16.981 | 17.055 | 0.272554 | 1.783 | 37.067 | Uses a strict complement base pair plus one extra free expert with `free_expert_scale=0.5`, raising active width to `1.5I`. It is clearly better than the standard 6E 5K baseline, but still behind the best scratch 20K complement-pair run. |
+| copy+noise 4e full top1 20k | active_path_fair | no | complete | 685722624 | 4 | 20000 | 17.135 | 17.226 | 0.915913 | 1.384 | 36.538 | full-width top-1 active-path-fair variant trained from scratch to 20k; healthy load balance but expert similarity remains high |
+| complement-pair 6e half top2 aux=0.005 20k | active_path_fair | no | complete | 581928960 | 6 | 20000 | 16.815 | 16.897 | 0.268439 | 1.641 | 36.969 | First scratch 20K complement-pair run; strong specialization and clear gains over non-MoE, though later aux=0.0001 20K improves further. |
+| complement-pair 6e half top2 aux=0.0001 20k | active_path_fair | no | complete | 581928960 | 6 | 20000 | 16.726 | 16.814 | 0.268614 | 1.767 | 37.065 | Scratch 20K extension of the best 5K aux=0.0001 setting; best complement-pair result so far, beating the earlier aux=0.005 20K run on both eval conventions. |
+| complement-pair 6e half top2 aux=0.0001 20k partial-full-ft 10k | active_path_fair | no | complete | 581928960 | 6 | 20k+10k continued | 16.724 | 16.807 | 0.268614 | 1.767 | 36.979 | Continue from the best aux=0.0001 20K checkpoint with model-weight-only init, keep MoE lr=1e-4, and unfreeze the full transformer backbone at lr=1e-5 while keeping embeddings and lm_head frozen. Improves PPL@1024 by about 0.007 over the base 20K checkpoint. |
+| complement-pair 6e half top2 aux=0.0001 20k local-tm-norm-ft 10k | active_path_fair | no | complete | 581928960 | 6 | 20k+10k continued | 16.725 | 16.811 | 0.268614 | 1.768 | 36.979 | Continue from the same best 20K checkpoint, but only unfreeze layer12-23 attn and norm parameters at lr=1e-5. Slightly improves PPL@1024 over the base 20K checkpoint, but the gain is extremely small. |
+| complement-pair 6e half top2 aux=0.0001 init-local-backbone-ft 20k | active_path_fair | no | complete | 581928960 | 6 | 20000 | 16.831 | 16.905 | 0.273919 | 1.595 | 18.851 | Initialize from the dense MMfreeLM-370M checkpoint, upcycle into 6E complement-pair MoE, and jointly train MoE plus layer12-23 local backbone for 20K steps. Training stays stable and pair usage remains almost perfectly uniform, but final PPL@1024 is clearly worse than the best scratch aux=0.0001 20K complement-pair run. |
 
-数据来源：
-
-- `outputs/*/train_log.jsonl`
-- `outputs/*/eval_results_64.json`
-- `outputs/*/eval_results_1024.json`
-- `current_project_status.md`
-
-口径说明：
-
-- `2026-05-25` 已对本文件涉及的主线实验做统一离线复评。
-- 这里的 `eval_results_64` 统一指当前口径：`batch_size=4`, `max_samples=256`。
-- 更早记录里的 `15.x` 级 `PPL@64` 属于旧口径结果，不再用于这里的横向比较。
-
-## 1. `router_aux_loss_coef` 5k sweep
-
-实验前缀：
-
-- `complement6e_half_top2_alpha005_*_5000step`
-
-固定条件：
-
-- `6 experts`
-- `top-2 strict complement pair routing`
-- `noise_alpha = 0.05`
-- `5000 training steps`
-
-| Experiment | `router_aux_loss_coef` | best `val_ppl` in train log | `eval_results_64` `val_ppl` | `eval_results_1024` `val_ppl` | `eval_results_1024` router entropy | avg expert similarity | Status |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `complement6e_half_top2_alpha005_aux001_5000step` | `0.001` | `15.8242` | `17.0793` | `17.1550` | `1.6612` | `0.272489` | completed |
-| `complement6e_half_top2_alpha005_aux0005_5000step` | `0.0005` | `15.8199` | `17.0664` | `17.1369` | `1.6879` | `0.272484` | completed |
-| `complement6e_half_top2_alpha005_aux0001_5000step` | `0.0001` | `15.7974` | `17.0382` | `17.1159` | `1.7346` | `0.272485` | completed |
-| `complement6e_half_top2_alpha005_aux00005_5000step` | `0.00005` | `15.8008` | `17.0391` | `17.1125` | `1.7414` | `0.272483` | completed |
-
-当前读取结论：
-
-- 按 `eval_results_64` 看，`aux=0.0001` 最优。
-- 按 `eval_results_1024` 看，`aux=0.00005` 最优。
-- 这四组的 `avg expert similarity` 几乎相同，差异主要体现在验证集指标和 router entropy。
-
-## 2. Completed Follow-Ups
-
-| Experiment | Change | best `val_ppl` in train log | `eval_results_64` `val_ppl` | `eval_results_1024` `val_ppl` | `eval_results_1024` router entropy | avg expert similarity | Status |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `complement6e_half_top2_alpha005_aux0001_20000step` | keep layer `12-23`, extend best 5k `aux=0.0001` setting to `20000` steps | `15.4997` | `16.7260` | `16.8139` | `1.7675` | `0.268614` | completed |
-| `complement6e_half_top2_alpha005_aux0001_layers6_23_5000step` | expand MoE layers from `12-23` to `6-23`, keep `aux=0.0001` and `5000` steps | `15.9158` | `17.1535` | `17.2318` | `1.7359` | `0.272888` | completed |
-
-当前读取结论：
-
-- `aux=0.0001` 的 scratch `20k` 已经明显优于之前的 `aux=0.005` `20k` 主线。
-- 将 MoE layer 从 `12-23` 扩到 `6-23` 后，`5k` 指标反而劣于标准 `12-layer` 版本，说明“多替几层”当前不是更高优先级方向。
-
-## 3. Local Adaptation Follow-Ups
-
-| Experiment | Change | best `val_ppl` in train log | `eval_results_64` `val_ppl` | `eval_results_1024` `val_ppl` | `eval_results_1024` router entropy | avg expert similarity | Status |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `complement6e_half_top2_alpha005_aux0001_unfreeze_moe_norm_5000step` | unfreeze only `layer12-23` `mlp_norm` around the MoE blocks, keep fixed `moe_output_scale=2.0` | `15.8002` | `17.0522` | `17.1132` | `1.7351` | `0.272481` | completed with offline re-eval |
-| `complement6e_half_top2_alpha005_aux0001_learnable_pair_scale_5000step` | keep RMSNorm frozen, add learnable positive per-layer/per-pair output scales initialized at `2.0` | `15.8222` | `17.0573` | `17.1193` | `1.7356` | `0.272543` | completed with offline re-eval |
-
-当前读取结论：
-
-- 这两组本地适配增强都没有实质性超过标准 `aux=0.0001` `5k` 基线的 `17.0382 / 17.1159`。
-- `unfreeze moe norm` 在 `1024-sample` 上略好于基线，但 `256-sample` 上也略差于基线，整体更像是“基本打平”而不是明确增益。
-- `learnable pair-scale` 学到的 scale 明显低于初始 `2.0`，但在统一复评口径下仍略差于 fixed-scale 基线，因此当前优先级也不高。
+- `PPL@64`: for rows refreshed on or after `2026-05-25`, loaded-checkpoint evaluation with `batch_size=4`, `max_samples=256`.
+- `PPL@1024`: loaded-checkpoint evaluation on 1024 validation samples when available.
+- `capacity_fair=yes` means total parameter count is kept effectively aligned with the non-moe baseline; `active_path_fair` rows may still have larger total parameter count.
+- Some untouched historical rows outside the refreshed mainline set may still carry older `PPL@64` values. `virtual-group 8e half 20k` is the only active-path-fair row in this table that remains historical because its output directory is currently unavailable.
+- Resume-based 5k->20k results remain excluded from scientific comparison after resume/LR-schedule issues were identified; only scratch-trained 20k runs are treated as authoritative.
+- The two `20k+10k continued` rows are not scratch 30K runs. They load only model weights from the best aux=0.0001 20K checkpoint and reinitialize optimizer/scheduler from scratch for an additional 10K finetune.

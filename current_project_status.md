@@ -386,6 +386,30 @@
 - 在统一口径下，标准 `complement6e aux=0.0001 5k` 基线是 `17.0382 / 17.1159`，`unfreeze moe norm` 是 `17.0522 / 17.1132`，`learnable pair-scale` 是 `17.0573 / 17.1193`；三者实际上非常接近。
 - 当前唯一还没能按同口径重刷的主线 active-path-fair 行是 `virtual-group 8e half 20k`，因为原始 output 目录目前找不到，所以总表里它暂时仍保留历史数值。
 
+### 6.9 Dense-Init Local Backbone Joint-Train 20k
+
+截至 `2026-05-28`，`complement6e_aux0001_init_local_backbone_ft_20000step` 已完成训练，并在 `matmulfreellm:cu126-py310` 容器环境中补做了统一离线复评。
+
+| Experiment | Change | best `val_ppl` in train log | `eval_results_64` `val_ppl` | `eval_results_1024` `val_ppl` | `eval_results_1024` router entropy | avg expert similarity |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `complement6e_aux0001_init_local_backbone_ft_20000step` | 从 dense `MMfreeLM-370M` 直接 upcycle 成 `6E complement-pair`，同时训练 MoE 与 `layer12-23` local backbone，训练 `20000 step` | `15.5688` | `16.8309` | `16.9046` | `1.5947` | `0.273919` |
+
+补充诊断：
+
+- `pair_fractions@1024 = [0.33435, 0.33325, 0.33239]`
+- `pair_entropy@1024 = 1.098609`
+- `normalized_pair_entropy@1024 = 0.999997`
+- `tokens_per_expert@1024 = [0.33435, 0.33325, 0.33239, 0.33239, 0.33325, 0.33435]`
+- `zero_ratio_avg ≈ 18.851%`
+- `trainable_params = 362,093,568`
+
+这组结果给出的结论也很明确：
+
+- 训练过程本身是稳定的，没有 collapse，`pair usage` 也几乎是完美均匀分配。
+- 但最终 `PPL@1024 = 16.9046` 明显弱于当前 best `complement6e_half_top2_alpha005_aux0001_20000step` 的 `16.8139`。
+- 相比直接从最优 `20k` MoE checkpoint 继续做 `partial-full-ft 10k` 或 `local-tm-norm-ft 10k`，这条“dense-init + local backbone joint-train”路线也没有体现出优势。
+- 因此当前更合理的判断是：这条路线不应替代现有 scratch complement-pair 主线，也不应优先于基于 best `20k` checkpoint 的小幅 continuation follow-up。
+
 ## 7. 当前环境状态
 
 当前项目使用 `uv` 管理本地虚拟环境，已确认：
