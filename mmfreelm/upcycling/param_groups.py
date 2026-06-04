@@ -10,13 +10,16 @@ from mmfreelm.upcycling.trainable_scope import (
     is_embedding_parameter,
     is_lm_head_parameter,
     is_moe_parameter,
+    is_moe_residual_scale_parameter,
+    is_moe_router_parameter,
+    is_moe_shared_expert_parameter,
     is_norm_parameter,
     local_backbone_parameter_name,
     parameter_layer_idx,
 )
 
 
-GROUP_ORDER = ("moe", "backbone", "norm_or_bias", "embed_lm_head")
+GROUP_ORDER = ("moe", "shared_expert", "backbone", "norm_or_bias", "embed_lm_head")
 
 
 def resolve_optimizer_hparams(config: Dict, training_cfg: Dict, freeze_cfg: Dict, freeze_mode: str) -> Dict[str, float]:
@@ -28,6 +31,12 @@ def resolve_optimizer_hparams(config: Dict, training_cfg: Dict, freeze_cfg: Dict
         )
     )
     default_backbone_lr = learning_rate * 0.1
+    shared_expert_lr = float(
+        config.get(
+            "shared_expert_lr",
+            training_cfg.get("shared_expert_lr", freeze_cfg.get("shared_expert_lr", default_backbone_lr)),
+        )
+    )
     backbone_lr = float(
         config.get(
             "backbone_lr",
@@ -45,6 +54,7 @@ def resolve_optimizer_hparams(config: Dict, training_cfg: Dict, freeze_cfg: Dict
     return {
         "learning_rate": learning_rate,
         "moe_lr": moe_lr,
+        "shared_expert_lr": shared_expert_lr,
         "backbone_lr": backbone_lr,
         "norm_lr": norm_lr,
         "embed_lr": None if embed_lr is None else float(embed_lr),
@@ -62,6 +72,10 @@ def _determine_group_name(
         return "embed_lm_head"
     if is_norm_parameter(name) or is_bias_parameter(name):
         return "norm_or_bias"
+    if is_moe_shared_expert_parameter(name):
+        return "shared_expert"
+    if is_moe_router_parameter(name) or is_moe_residual_scale_parameter(name):
+        return "moe"
     if is_moe_parameter(name):
         return "moe"
     if freeze_mode == "local_backbone_ft" and local_backbone_parameter_name(name, local_backbone_layer_indices):
@@ -75,6 +89,7 @@ def build_optimizer_param_groups(
     model,
     freeze_mode: str,
     moe_lr: float,
+    shared_expert_lr: float,
     backbone_lr: float,
     norm_lr: float,
     embed_lr: Optional[float],
@@ -84,6 +99,12 @@ def build_optimizer_param_groups(
     group_specs = {
         "moe": {
             "lr": float(moe_lr),
+            "weight_decay": float(weight_decay),
+            "params": [],
+            "names": [],
+        },
+        "shared_expert": {
+            "lr": float(shared_expert_lr),
             "weight_decay": float(weight_decay),
             "params": [],
             "names": [],
@@ -164,6 +185,7 @@ def build_optimizer_param_groups(
 def optimizer_lr_map(optimizer) -> Dict[str, Optional[float]]:
     lr_map: Dict[str, Optional[float]] = {
         "lr_moe": None,
+        "lr_shared_expert": None,
         "lr_backbone": None,
         "lr_norm_or_bias": None,
         "lr_embed_lm_head": None,
@@ -172,6 +194,8 @@ def optimizer_lr_map(optimizer) -> Dict[str, Optional[float]]:
         group_name = group.get("name")
         if group_name == "moe":
             lr_map["lr_moe"] = float(group["lr"])
+        elif group_name == "shared_expert":
+            lr_map["lr_shared_expert"] = float(group["lr"])
         elif group_name == "backbone":
             lr_map["lr_backbone"] = float(group["lr"])
         elif group_name == "norm_or_bias":
@@ -188,6 +212,7 @@ def run_strict_trainable_checks(
     freeze_embeddings: bool,
     freeze_lm_head: bool,
     local_backbone_layer_indices: Sequence[int],
+    require_moe_router: bool = True,
 ) -> List[str]:
     issues: List[str] = []
     counts = trainable_summary["trainable_parameter_counts_by_module_type"]
@@ -200,9 +225,9 @@ def run_strict_trainable_checks(
 
     group_by_name = {entry["group_name"]: entry for entry in optimizer_group_summary}
 
-    if counts["moe_router"] <= 0:
+    if require_moe_router and counts["moe_router"] <= 0:
         issues.append("No trainable MoE router parameters found.")
-    if counts["moe_experts"] <= 0:
+    if counts["moe_experts"] + counts.get("moe_shared_expert", 0) <= 0:
         issues.append("No trainable MoE expert parameters found.")
 
     if freeze_embeddings and embedding_count != 0:

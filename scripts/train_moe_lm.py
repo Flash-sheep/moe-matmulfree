@@ -306,6 +306,79 @@ def flatten_router_metrics(router_metrics: Optional[Tuple[Dict[str, torch.Tensor
             result[key] = mean_values
         else:
             result[key] = float(stacked.mean().item())
+    return enrich_router_metrics(result)
+
+
+def _distribution_entropy(values: Sequence[float]) -> Tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    tensor = torch.tensor(list(values), dtype=torch.float32)
+    tensor = tensor.clamp_min(0.0)
+    total = float(tensor.sum().item())
+    if total <= 0:
+        return 0.0, 0.0
+    fraction = tensor / total
+    safe_fraction = fraction.clamp_min(1e-9)
+    entropy = float((-(safe_fraction * safe_fraction.log()).sum()).item())
+    normalized = float(entropy / math.log(max(int(fraction.numel()), 2))) if fraction.numel() > 1 else 0.0
+    return entropy, normalized
+
+
+def enrich_router_metrics(metrics: Dict[str, object]) -> Dict[str, object]:
+    enriched = dict(metrics)
+    tokens_per_expert = enriched.get("tokens_per_expert")
+    if isinstance(tokens_per_expert, list) and tokens_per_expert:
+        expert_entropy, normalized_expert_entropy = _distribution_entropy(tokens_per_expert)
+        enriched.setdefault("expert_usage", tokens_per_expert)
+        if (
+            "sparse_expert_entropy" in enriched
+            or "normalized_sparse_expert_entropy" in enriched
+            or "sparse_load_imbalance" in enriched
+            or "dead_sparse_expert_count" in enriched
+        ):
+            enriched.setdefault("sparse_expert_usage", tokens_per_expert)
+        enriched.setdefault("expert_entropy", expert_entropy)
+        enriched.setdefault("normalized_expert_entropy", normalized_expert_entropy)
+        enriched.setdefault("expert_load_imbalance", float(max(tokens_per_expert) - min(tokens_per_expert)))
+        enriched.setdefault("dead_expert_count", int(sum(1 for value in tokens_per_expert if float(value) <= 1e-8)))
+
+    pair_fraction = enriched.get("pair_fraction")
+    if isinstance(pair_fraction, list) and pair_fraction:
+        pair_entropy, normalized_pair_entropy = _distribution_entropy(pair_fraction)
+        enriched.setdefault("pair_usage", pair_fraction)
+        enriched.setdefault("global_pair_fraction", pair_fraction)
+        enriched.setdefault("pair_entropy", pair_entropy)
+        enriched.setdefault("normalized_pair_entropy", normalized_pair_entropy)
+        enriched.setdefault("pair_load_imbalance", float(max(pair_fraction) - min(pair_fraction)))
+
+    free_expert_fraction = enriched.get("free_expert_fraction")
+    if isinstance(free_expert_fraction, list) and free_expert_fraction:
+        free_entropy, normalized_free_entropy = _distribution_entropy(free_expert_fraction)
+        enriched.setdefault("free_expert_usage", free_expert_fraction)
+        enriched.setdefault("free_expert_entropy", free_entropy)
+        enriched.setdefault("normalized_free_expert_entropy", normalized_free_entropy)
+
+    return enriched
+
+
+def extract_optional_loss_metrics(outputs) -> Dict[str, Optional[float]]:
+    result: Dict[str, Optional[float]] = {}
+    for output_name, field_name in (
+        ("loss", "total_loss"),
+        ("lm_loss", "lm_loss"),
+        ("router_aux_loss", "router_aux_loss"),
+        ("router_z_loss", "router_z_loss"),
+        ("load_balancing_loss", "load_balancing_loss"),
+    ):
+        value = getattr(outputs, output_name, None)
+        if value is None:
+            result[field_name] = None
+        else:
+            result[field_name] = float(value.detach().cpu())
+    if result["lm_loss"] is None:
+        result["lm_loss"] = result["total_loss"]
+    if result["router_aux_loss"] is None:
+        result["router_aux_loss"] = 0.0
     return result
 
 
@@ -381,6 +454,8 @@ def evaluate(
     total_lm_loss = 0.0
     total_router_aux = 0.0
     total_batches = 0
+    total_sequences = 0
+    total_tokens = 0
     router_entropy_values: List[float] = []
     tokens_per_expert_values: List[List[float]] = []
 
@@ -388,6 +463,8 @@ def evaluate(
         if args.max_eval_batches is not None and batch_index >= args.max_eval_batches:
             break
         input_ids = batch["input_ids"].to(device)
+        total_sequences += int(input_ids.shape[0])
+        total_tokens += int(input_ids.numel())
         with precision_context(precision_dtype):
             outputs = model(
                 input_ids=input_ids,
@@ -409,11 +486,32 @@ def evaluate(
         raise RuntimeError("Validation loader produced zero batches.")
 
     avg_loss = total_loss / total_batches
+    eval_name = getattr(args, "eval_name", "eval")
+    eval_scope = getattr(args, "eval_scope", None)
+    if eval_scope is None:
+        if eval_name == "proxy_val":
+            eval_scope = f"proxy_{total_sequences}seq"
+        else:
+            eval_scope = f"{total_sequences}seq"
     metrics: Dict[str, float] = {
+        "eval_name": eval_name,
+        "eval_scope": eval_scope,
         "val_loss": avg_loss,
         "val_ppl": float(math.exp(min(avg_loss, 20.0))),
         "val_lm_loss": total_lm_loss / total_batches,
         "val_router_aux_loss": total_router_aux / total_batches,
+        "batch_size": getattr(args, "batch_size", None),
+        "max_eval_batches": getattr(args, "max_eval_batches", None),
+        "max_val_samples": getattr(args, "max_val_samples", None),
+        "actual_num_batches": total_batches,
+        "actual_num_sequences": total_sequences,
+        "actual_num_tokens": total_tokens,
+        "data_source": getattr(args, "data_source", None),
+        "split": getattr(args, "split", None),
+        "checkpoint_source": getattr(args, "checkpoint_source", None),
+        "eval_seed": getattr(args, "eval_seed", None),
+        "eval_file_list": getattr(args, "eval_file_list", None),
+        "eval_file_count": getattr(args, "eval_file_count", None),
     }
     if router_entropy_values:
         metrics["val_router_entropy"] = sum(router_entropy_values) / len(router_entropy_values)
@@ -462,11 +560,24 @@ def main() -> None:
         global_step = resume_checkpoint(args.resume_from, model, optimizer, scheduler, scaler, device)
 
     train_iter: Iterator[Dict[str, torch.Tensor]] = cycle(train_loader)
-    running_loss = 0.0
+    window_total_loss_sum = 0.0
+    window_lm_loss_sum = 0.0
+    window_router_aux_loss_sum = 0.0
+    window_router_z_loss_sum = 0.0
+    window_load_balancing_loss_sum = 0.0
+    window_raw_accumulated_total_loss_sum = 0.0
+    window_grad_norm_sum = 0.0
+    window_num_steps = 0
 
     while global_step < args.max_steps:
         optimizer.zero_grad(set_to_none=True)
         last_outputs = None
+        step_total_loss_sum = 0.0
+        step_lm_loss_sum = 0.0
+        step_router_aux_loss_sum = 0.0
+        step_router_z_loss_sum = 0.0
+        step_load_balancing_loss_sum = 0.0
+        step_microbatch_count = 0
         for _ in range(args.gradient_accumulation_steps):
             batch = next(train_iter)
             input_ids = batch["input_ids"].to(device)
@@ -479,8 +590,16 @@ def main() -> None:
                 )
                 loss = outputs.loss / args.gradient_accumulation_steps
             scaler.scale(loss).backward()
-            running_loss += float(outputs.loss.detach().cpu())
             last_outputs = outputs
+            optional_losses = extract_optional_loss_metrics(outputs)
+            step_total_loss_sum += float(optional_losses["total_loss"] or 0.0)
+            step_lm_loss_sum += float(optional_losses["lm_loss"] or 0.0)
+            step_router_aux_loss_sum += float(optional_losses["router_aux_loss"] or 0.0)
+            if optional_losses["router_z_loss"] is not None:
+                step_router_z_loss_sum += float(optional_losses["router_z_loss"])
+            if optional_losses["load_balancing_loss"] is not None:
+                step_load_balancing_loss_sum += float(optional_losses["load_balancing_loss"])
+            step_microbatch_count += 1
 
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -489,21 +608,60 @@ def main() -> None:
         scheduler.step()
         global_step += 1
 
+        step_total_loss_avg = step_total_loss_sum / max(step_microbatch_count, 1)
+        step_lm_loss_avg = step_lm_loss_sum / max(step_microbatch_count, 1)
+        step_router_aux_loss_avg = step_router_aux_loss_sum / max(step_microbatch_count, 1)
+        step_router_z_loss_avg = step_router_z_loss_sum / max(step_microbatch_count, 1) if step_microbatch_count > 0 else None
+        step_load_balancing_loss_avg = (
+            step_load_balancing_loss_sum / max(step_microbatch_count, 1) if step_microbatch_count > 0 else None
+        )
+        grad_norm_value = float(grad_norm.detach().cpu()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+        window_total_loss_sum += step_total_loss_avg
+        window_lm_loss_sum += step_lm_loss_avg
+        window_router_aux_loss_sum += step_router_aux_loss_avg
+        if step_router_z_loss_avg is not None:
+            window_router_z_loss_sum += step_router_z_loss_avg
+        if step_load_balancing_loss_avg is not None:
+            window_load_balancing_loss_sum += step_load_balancing_loss_avg
+        window_raw_accumulated_total_loss_sum += step_total_loss_sum
+        window_grad_norm_sum += grad_norm_value
+        window_num_steps += 1
+
         flat_router = flatten_router_metrics(last_outputs.router_metrics if last_outputs is not None else None)
         train_record: Dict[str, object] = {
             "step": global_step,
-            "train_loss": running_loss / max(args.log_steps, 1),
-            "lm_loss": float(last_outputs.lm_loss.detach().cpu()) if last_outputs and last_outputs.lm_loss is not None else None,
-            "router_aux_loss": float(last_outputs.router_aux_loss.detach().cpu()) if last_outputs and last_outputs.router_aux_loss is not None else None,
-            "grad_norm": float(grad_norm.detach().cpu()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
+            "train_loss": window_total_loss_sum / max(window_num_steps, 1),
+            "total_loss": window_total_loss_sum / max(window_num_steps, 1),
+            "normalized_total_loss": window_total_loss_sum / max(window_num_steps, 1),
+            "lm_loss": window_lm_loss_sum / max(window_num_steps, 1),
+            "normalized_lm_loss": window_lm_loss_sum / max(window_num_steps, 1),
+            "router_aux_loss": window_router_aux_loss_sum / max(window_num_steps, 1),
+            "normalized_router_aux_loss": window_router_aux_loss_sum / max(window_num_steps, 1),
+            "raw_accumulated_total_loss": window_raw_accumulated_total_loss_sum / max(window_num_steps, 1),
+            "grad_norm": grad_norm_value,
+            "grad_norm_last": grad_norm_value,
+            "grad_norm_avg": window_grad_norm_sum / max(window_num_steps, 1),
             "lr": scheduler.get_last_lr()[0],
+            "loss_logging_version": "v2_normalized",
+            "train_loss_is_normalized": True,
         }
+        if step_router_z_loss_avg is not None:
+            train_record["router_z_loss"] = window_router_z_loss_sum / max(window_num_steps, 1)
+        if step_load_balancing_loss_avg is not None:
+            train_record["load_balancing_loss"] = window_load_balancing_loss_sum / max(window_num_steps, 1)
         train_record.update(flat_router)
 
         if global_step % args.log_steps == 0:
             append_jsonl(log_path, train_record)
             print(json.dumps(train_record, ensure_ascii=False, default=json_default))
-            running_loss = 0.0
+            window_total_loss_sum = 0.0
+            window_lm_loss_sum = 0.0
+            window_router_aux_loss_sum = 0.0
+            window_router_z_loss_sum = 0.0
+            window_load_balancing_loss_sum = 0.0
+            window_raw_accumulated_total_loss_sum = 0.0
+            window_grad_norm_sum = 0.0
+            window_num_steps = 0
 
         if global_step % args.eval_steps == 0 or global_step == args.max_steps:
             eval_metrics = evaluate(model, val_loader, device, args)

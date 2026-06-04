@@ -227,6 +227,41 @@
 - 已通过最小 smoke 检查
 - 已完成一轮真实 sparse upcycling pilot，但还没有足够长的训练来判断最终 expert 分化与精度上限
 
+### 4.1 Shared-Family 近期结论
+
+`shared_residual / full_shared` 家族在 `2026-06-03` 前后的实验需要严格区分：
+
+- 旧的 `full_shared` 与 `shared_residual` 结果中，有一批曾经受到 shared-copy bug 污染：
+  - `initialize_shared_expert_from_dense()` 起初没有完整复制内部 `norm` 参数；
+  - 新建 shared / sparse expert 模块的 `dtype` 也一度没有对齐到原 dense MLP。
+- 该问题修复后，`full_shared_no_residual identity eval` 已经与 dense baseline 严格等价，说明 shared copy 路径现在是可信的。
+
+基于修复后的 clean rerun，目前可以成立的结论是：
+
+- `full_shared` 控制组在 `shared_width = 2816` 时已经回到 dense baseline 附近：
+  - 最好的是 `full_shared_8x32_top2_alpha005_local_backbone_ft_5k`
+  - `PPL@1024 ≈ 17.288`
+  - 略优于 dense baseline `≈ 17.294`
+- 因此，之前 `full_shared` 明显差于 baseline 的现象主要来自实现 bug，而不是结构本身。
+
+- `shared_residual topchannel + discarded residual` 路线在修复后反而更差，而且现在这个更差的结果更可信：
+  - `4x128 top1` / `8x64 top2` clean rerun 都落在 `PPL@1024 ≈ 20.06 ~ 20.12`
+  - 明显差于 dense baseline，也远差于 `full_shared`
+  - 其中 `8x64 top2` 虽然略优于 `4x128 top1`，但 router entropy 更低、load imbalance 更高，路由健康度更差
+
+- 额外的 `shared-only-from-dense 2288` eval-only 诊断进一步说明：
+  - 在同样 `resolved_shared_width = 2288` 下，
+  - 如果完全拿掉 sparse residual，只保留从 dense checkpoint 直接构建的 shared-only 路径，
+  - `PPL@1024 ≈ 20.548`
+  - 这比训练后的 `shared_residual` 结果还要更差约 `0.43 ~ 0.49`
+
+所以当前更准确的结构判断是：
+
+- `shared_width = 2288` 这一级别的 top-channel 压缩本身就已经造成很大损伤；
+- sparse residual 不是当前 20.x PPL 的唯一根因；
+- 在这条路线里，residual branch 实际上是在“部分补回 shared 压缩损失”，但补回幅度远远不够；
+- 也就是说，当前失败的主因是 `shared path` 压缩过重，而不是“加了 sparse residual 以后才变差”。
+
 ## 5. 后续最小必需输入
 
 为了继续进入更严格的真实实验阶段，仍需要进一步明确或补齐以下内容：
@@ -381,7 +416,7 @@
 纠偏后可以明确看到：
 
 - `PPL@1024` 基本一直是稳定的，主线实验相对排序几乎不变。
-- `PPL@64` 的绝对值整体上移了约 `1.2` 到 `1.3`，包括 non-MoE baseline 自身也从旧记录的 `15.9501` 变为统一复评后的 `17.2141`。
+- `PPL@64` 的绝对值整体上移了约 `1.2` 到 `1.3`，包括 non-MoE baseline 自身也从旧记录的 `15.9501` 变为统一复评后的约 `17.214`。在 `2026-05-28` 按当前 metadata-aware 评测路径重跑后，baseline 仍稳定在 `17.2137 / 17.2942`。
 - 因此，之前“某些新实验在 `PPL@64` 上比 baseline 差很多”的现象，主要不是训练代码坏掉，而是旧 baseline 和新复评结果不在同一评测口径。
 - 在统一口径下，标准 `complement6e aux=0.0001 5k` 基线是 `17.0382 / 17.1159`，`unfreeze moe norm` 是 `17.0522 / 17.1132`，`learnable pair-scale` 是 `17.0573 / 17.1193`；三者实际上非常接近。
 - 当前唯一还没能按同口径重刷的主线 active-path-fair 行是 `virtual-group 8e half 20k`，因为原始 output 目录目前找不到，所以总表里它暂时仍保留历史数值。
@@ -436,3 +471,38 @@
 
 - 项目还没有作为已安装包写入 `.venv`
 - `import mmfreelm` 在仓库根目录下可用，但在仓库外路径下仍不可用
+
+### 6.10 Recent 20k/40k Follow-up Results
+
+| Experiment | Formal `PPL@64` | Formal `PPL@1024` | Router entropy | Avg expert similarity | Zero ratio | Note |
+| --- | --- | --- | --- | --- | --- | --- |
+| `moe8e_half_top2_random_extreme_local_backbone_ft_40000step` | `22.5616` | `22.6484` | `1.4258` | `0.002544` | `15.561%` | Extreme specialization with near-zero similarity, but catastrophic formal perplexity. |
+| `moe4e_full_top1_random_extreme_local_backbone_ft_40000step` | `25.2194` | `25.4243` | `1.3856` | `0.002140` | `15.596%` | Top-1 full-width random-extreme local-backbone fine-tuning fails even more severely. |
+| `complement6e_pair_plus_free_top3_scale050_alpha005_aux0001_20000step` | `16.7786` | `16.8707` | `1.7872` | `0.268994` | `18.807%` | Stable and useful, but still behind the best strict 6E complement scratch-20K mainline. |
+
+结论：`random_extreme_local_backbone_ft` 这条线虽然把 expert similarity 压到了几乎 0，但正式 `PPL@1024` 明显崩坏，说明这类“强行极端分化”不是可行主线。相比之下，`pair+free scale=0.50` 延长到 `20k` 后仍然稳定，但还没有超过当前最强 `6E complement aux=1e-4 20k` 主线。
+
+## 6. Shared-Residual Iso-Area 5K Screening Update
+
+最新完成两组 strict-parameter-fair shared-residual 5K screening：
+
+- `shared_residual_2304_4x128_top1_alpha010_isoarea_local_backbone_ft_5000step`
+- `shared_residual_2304_4x128_top1_alpha025_isoarea_local_backbone_ft_5000step`
+
+两组都满足：
+
+- total params `373,616,460 <= 374,108,160` baseline
+- resolved shared width = `2288`
+- active width ratio vs dense = `0.858x`
+- sparse residual experts 使用 `random_ternary_matched`，zero ratio 约 `36.6%`
+
+正式结果显示：
+
+- `alpha=0.10`: `PPL@1024 = 19.118`
+- `alpha=0.25`: `PPL@1024 = 19.085`
+
+结论：
+
+- 该 shared-residual iso-area 设计当前可以稳定训练、保存、复评并绘图；
+- `alpha=0.25` 略好于 `alpha=0.10`；
+- 但两者都显著差于 non-MoE baseline 和当前 6E complement 主线，因此这版结构暂时不构成可行主线。

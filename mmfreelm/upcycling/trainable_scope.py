@@ -9,6 +9,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 MODULE_TYPES = (
     "moe_router",
     "moe_experts",
+    "moe_shared_expert",
+    "moe_residual_scale",
     "moe_pair_scales",
     "token_mixer",
     "attention_or_sequence_mixer",
@@ -81,16 +83,30 @@ def is_moe_router_parameter(name: str) -> bool:
     return ".mlp.router." in name
 
 
+def is_moe_shared_expert_parameter(name: str) -> bool:
+    return ".mlp.shared_expert." in name
+
+
 def is_moe_pair_scale_parameter(name: str) -> bool:
     return name.endswith("pair_log_scales")
 
 
+def is_moe_residual_scale_parameter(name: str) -> bool:
+    return ".mlp.raw_residual_scale" in name
+
+
 def is_moe_expert_parameter(name: str) -> bool:
-    return ".mlp.experts." in name
+    return ".mlp.experts." in name or ".mlp.sparse_experts." in name
 
 
 def is_moe_parameter(name: str) -> bool:
-    return is_moe_router_parameter(name) or is_moe_expert_parameter(name) or is_moe_pair_scale_parameter(name)
+    return (
+        is_moe_router_parameter(name)
+        or is_moe_expert_parameter(name)
+        or is_moe_shared_expert_parameter(name)
+        or is_moe_pair_scale_parameter(name)
+        or is_moe_residual_scale_parameter(name)
+    )
 
 
 def is_bias_parameter(name: str) -> bool:
@@ -141,6 +157,10 @@ def classify_parameter_module_type(name: str) -> str:
         return "lm_head"
     if is_moe_router_parameter(name):
         return "moe_router"
+    if is_moe_shared_expert_parameter(name):
+        return "moe_shared_expert"
+    if is_moe_residual_scale_parameter(name):
+        return "moe_residual_scale"
     if is_moe_pair_scale_parameter(name):
         return "moe_pair_scales"
     if is_moe_expert_parameter(name):

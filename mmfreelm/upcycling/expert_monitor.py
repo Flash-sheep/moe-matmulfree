@@ -66,6 +66,12 @@ class ExpertMonitor:
         return norms
 
     def _compute_router_stats(self, moe) -> Dict[str, float]:
+        if getattr(moe, "router", None) is None:
+            return {
+                "weight_mean": 0.0,
+                "weight_std": 0.0,
+                "weight_norm": 0.0,
+            }
         router = moe.router.gate
         w = router.weight.data.detach().float()
         return {

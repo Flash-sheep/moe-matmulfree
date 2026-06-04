@@ -7,7 +7,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -20,7 +20,7 @@ from mmfreelm.models.hgrn_bit.modeling_hgrn_bit import HGRNBitForCausalLM
 from mmfreelm.upcycling import ExpertMonitor, StreamingTextDataset, apply_freeze_for_upcycling, upcycle_dense_to_moe
 from scripts.complement_pair_diagnostics_lib import aggregate_router_usage
 from scripts.run_sparse_upcycling import collate_streaming_batch
-from scripts.train_moe_lm import ensure_cuda_device, evaluate, get_precision_dtype, precision_context
+from scripts.train_moe_lm import ensure_cuda_device, enrich_router_metrics, evaluate, get_precision_dtype, precision_context
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +45,18 @@ def write_json(path: Path, payload) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _distribution_entropy(values: List[float]) -> Tuple[float, float]:
+    safe_values = [max(float(value), 1e-9) for value in values]
+    total = sum(safe_values)
+    if total <= 0.0:
+        return 0.0, 0.0
+    normalized = [value / total for value in safe_values]
+    entropy = float(-sum(value * math.log(value) for value in normalized))
+    max_entropy = math.log(len(normalized)) if normalized else 0.0
+    normalized_entropy = float(entropy / max_entropy) if max_entropy > 0 else 0.0
+    return entropy, normalized_entropy
+
+
 def load_jsonl(path: Path) -> List[Dict]:
     if not path.exists():
         return []
@@ -63,7 +75,7 @@ def build_loader(
     text_field: str,
     batch_size: int,
     max_samples: int | None,
-) -> DataLoader:
+) -> Tuple[DataLoader, Dict[str, object]]:
     dataset = StreamingTextDataset(
         data_source=data_source,
         tokenizer_path=tokenizer_path,
@@ -72,7 +84,8 @@ def build_loader(
         text_field=text_field,
         max_samples=max_samples,
     )
-    return DataLoader(dataset, batch_size=batch_size, num_workers=0, pin_memory=True, collate_fn=collate_streaming_batch)
+    loader = DataLoader(dataset, batch_size=batch_size, num_workers=0, pin_memory=True, collate_fn=collate_streaming_batch)
+    return loader, dataset.get_manifest()
 
 
 def compute_ternary_ratios(model, moe_layer_indices: List[int]) -> Dict[str, Dict[str, Dict[str, float]]]:
@@ -114,7 +127,7 @@ def flatten_router_metrics(router_metrics) -> Dict[str, float]:
             result[key] = stacked.mean(dim=0).tolist()
         else:
             result[key] = float(stacked.mean().item())
-    return result
+    return enrich_router_metrics(result)
 
 
 @torch.no_grad()
@@ -205,7 +218,25 @@ def build_initial_upcycled_model(config: Dict, pretrained_path: str) -> HGRNBitF
         enable_learnable_output_scale=moe_cfg.get("enable_learnable_moe_output_scale", False),
         output_scale_granularity=moe_cfg.get("scale_granularity", "global"),
         initial_moe_output_scale=moe_cfg.get("initial_moe_output_scale"),
+        moe_arch=moe_cfg.get("moe_arch", "standard"),
+        enable_sparse_residual=moe_cfg.get("enable_sparse_residual", True),
+        nominal_shared_width=moe_cfg.get("nominal_shared_width"),
+        auto_resolve_shared_width=moe_cfg.get("auto_resolve_shared_width", False),
+        min_shared_width=moe_cfg.get("min_shared_width", 2048),
+        shared_width_step=moe_cfg.get("shared_width_step", 16),
+        strict_total_param_fair=moe_cfg.get("strict_total_param_fair", False),
+        shared_init=moe_cfg.get("shared_init", "dense_prefix"),
+        sparse_init=moe_cfg.get("sparse_init", "random_ternary_matched"),
+        sparse_expert_width=moe_cfg.get("sparse_expert_width", 128),
+        sparse_top_k=moe_cfg.get("sparse_top_k", 1),
+        residual_scale_init=moe_cfg.get("residual_scale_init", 0.1),
+        residual_scale_learnable=moe_cfg.get("residual_scale_learnable", True),
+        residual_scale_max=moe_cfg.get("residual_scale_max", 0.5),
+        skip_param_budget_resolver=moe_cfg.get("skip_param_budget_resolver", False),
     )
+    freeze_mode = freeze_cfg.get("freeze_mode", "moe_only")
+    norm_scope = freeze_cfg.get("norm_scope", "none")
+    local_backbone_layer_indices = freeze_cfg.get("local_backbone_layer_indices")
     apply_freeze_for_upcycling(
         model=model,
         moe_layer_indices=moe_layer_indices,
@@ -215,6 +246,9 @@ def build_initial_upcycled_model(config: Dict, pretrained_path: str) -> HGRNBitF
         freeze_non_moe_mlp=freeze_cfg.get("freeze_non_moe_mlp", True),
         freeze_rmsnorm=freeze_cfg.get("freeze_rmsnorm", True),
         trainable_extra_patterns=freeze_cfg.get("trainable_extra_patterns", []),
+        freeze_mode=freeze_mode,
+        local_backbone_layer_indices=local_backbone_layer_indices,
+        norm_scope=norm_scope,
     )
     return model
 
@@ -276,31 +310,133 @@ def extract_learned_output_scales(model: HGRNBitForCausalLM, moe_layer_indices: 
     }
 
 
-def build_loss_curve(log_records: List[Dict]) -> Dict[str, List[Dict]]:
+def build_loss_curve(
+    log_records: List[Dict],
+    eval1024: Dict | None = None,
+    formal_checkpoint_source: str | None = None,
+) -> Dict[str, List[Dict]]:
     train_curve = []
     eval_curve = []
+    train_optional_fields = [
+        "total_loss",
+        "normalized_total_loss",
+        "normalized_lm_loss",
+        "normalized_router_aux_loss",
+        "raw_accumulated_total_loss",
+        "router_z_loss",
+        "load_balancing_loss",
+        "lm_loss",
+        "router_aux_loss",
+        "grad_norm",
+        "grad_norm_last",
+        "grad_norm_avg",
+        "lr",
+        "lr_moe",
+        "lr_shared_expert",
+        "lr_backbone",
+        "lr_norm_or_bias",
+        "lr_embed_lm_head",
+        "tokens_seen",
+        "elapsed_time",
+        "elapsed_time_sec",
+        "loss_logging_version",
+        "router_entropy",
+        "expert_usage",
+        "expert_entropy",
+        "normalized_expert_entropy",
+        "expert_load_imbalance",
+        "dead_expert_count",
+        "pair_usage",
+        "global_pair_fraction",
+        "pair_entropy",
+        "normalized_pair_entropy",
+        "pair_load_imbalance",
+        "strict_complement_pair_fraction",
+        "non_complement_pair_fraction",
+        "average_coverage_penalty",
+        "repeated_quarter_frequency",
+        "missing_quarter_frequency",
+        "free_expert_usage",
+        "free_expert_entropy",
+        "normalized_free_expert_entropy",
+        "free_expert_overlap_rate",
+        "base_output_norm",
+        "free_output_norm",
+        "final_output_norm",
+        "active_width_ratio",
+        "free_expert_scale",
+        "shared_output_norm",
+        "sparse_output_norm",
+        "sparse_to_shared_norm_ratio",
+        "residual_scale",
+        "active_width",
+        "active_width_ratio",
+        "shared_width",
+        "sparse_expert_width",
+        "num_sparse_experts",
+        "active_sparse_experts",
+        "iso_area_budget_width",
+        "parameter_budget_delta",
+        "router_params",
+        "shared_expert_params",
+        "sparse_expert_params",
+    ]
     for record in log_records:
-        if "train_loss" in record:
-            train_curve.append(
-                {
-                    "step": record["step"],
-                    "train_loss": record.get("train_loss"),
-                    "lm_loss": record.get("lm_loss"),
-                    "router_aux_loss": record.get("router_aux_loss"),
-                    "grad_norm": record.get("grad_norm"),
-                    "lr": record.get("lr"),
-                }
-            )
-        if "val_loss" in record:
+        if "train_loss" in record or "normalized_total_loss" in record:
+            train_entry = {
+                "step": record["step"],
+                "train_loss": record.get("train_loss", record.get("normalized_total_loss")),
+            }
+            for field in train_optional_fields:
+                if field in record:
+                    train_entry[field] = record.get(field)
+            train_curve.append(train_entry)
+        if "proxy_val_loss" in record or record.get("val_eval_name") == "proxy_val":
             eval_curve.append(
                 {
                     "step": record["step"],
-                    "val_loss": record.get("val_loss"),
-                    "val_ppl": record.get("val_ppl"),
-                    "val_router_entropy": record.get("val_router_entropy"),
+                    "proxy_val_loss": record.get("proxy_val_loss", record.get("val_loss")),
+                    "proxy_val_ppl": record.get("proxy_val_ppl", record.get("val_ppl")),
+                    "proxy_val_lm_loss": record.get("proxy_val_lm_loss", record.get("val_lm_loss")),
+                    "proxy_val_router_aux_loss": record.get("proxy_val_router_aux_loss", record.get("val_router_aux_loss")),
+                    "proxy_val_router_entropy": record.get("proxy_val_router_entropy", record.get("val_router_entropy")),
+                    "proxy_val_actual_num_batches": record.get("proxy_val_actual_num_batches", record.get("val_actual_num_batches")),
+                    "proxy_val_actual_num_sequences": record.get("proxy_val_actual_num_sequences", record.get("val_actual_num_sequences")),
+                    "proxy_val_actual_num_tokens": record.get("proxy_val_actual_num_tokens", record.get("val_actual_num_tokens")),
+                    "proxy_val_scope": record.get("proxy_val_scope", record.get("val_eval_scope")),
+                    "proxy_val_max_eval_batches": record.get("proxy_val_max_eval_batches"),
+                    "proxy_val_max_val_samples": record.get("proxy_val_max_val_samples"),
+                    "val_loss": record.get("proxy_val_loss", record.get("val_loss")),
+                    "val_ppl": record.get("proxy_val_ppl", record.get("val_ppl")),
+                    "val_lm_loss": record.get("proxy_val_lm_loss", record.get("val_lm_loss")),
+                    "eval_name": record.get("val_eval_name", "proxy_val"),
+                    "eval_scope": record.get("proxy_val_scope", record.get("val_eval_scope")),
+                    "actual_num_batches": record.get("proxy_val_actual_num_batches", record.get("val_actual_num_batches")),
+                    "actual_num_sequences": record.get("proxy_val_actual_num_sequences", record.get("val_actual_num_sequences")),
+                    "actual_num_tokens": record.get("proxy_val_actual_num_tokens", record.get("val_actual_num_tokens")),
                 }
             )
-    return {"train": train_curve, "eval": eval_curve}
+    formal_eval_curve = []
+    if eval1024 is not None:
+        formal_eval_curve.append(
+            {
+                "step": None,
+                "val_loss": eval1024.get("val_loss"),
+                "val_ppl": eval1024.get("val_ppl"),
+                "val_lm_loss": eval1024.get("val_lm_loss"),
+                "val_router_aux_loss": eval1024.get("val_router_aux_loss"),
+                "val_router_entropy": eval1024.get("val_router_entropy"),
+                "eval_name": eval1024.get("eval_name", "formal_eval_1024"),
+                "eval_scope": eval1024.get("eval_scope", "1024seq"),
+                "actual_num_batches": eval1024.get("actual_num_batches"),
+                "actual_num_sequences": eval1024.get("actual_num_sequences"),
+                "actual_num_tokens": eval1024.get("actual_num_tokens"),
+                "checkpoint_source": formal_checkpoint_source,
+                "formal_eval_1024_lm_loss": eval1024.get("val_lm_loss"),
+                "formal_eval_1024_ppl": eval1024.get("val_ppl"),
+            }
+        )
+    return {"train": train_curve, "eval": eval_curve, "formal_eval_1024": formal_eval_curve}
 
 
 def build_relaxed_pair_usage_payload(model: HGRNBitForCausalLM, pair_usage_1024: Dict[str, object]) -> Dict[str, object]:
@@ -359,6 +495,55 @@ def build_free_expert_usage_payload(pair_usage_1024: Dict[str, object]) -> Dict[
     }
 
 
+def build_shared_residual_metrics_payload(
+    config: Dict[str, object],
+    init_verification: Dict[str, object],
+    eval_results_1024: Dict[str, object],
+    pair_usage_1024: Dict[str, object],
+    checkpoint_path: Path,
+) -> Dict[str, object]:
+    moe_cfg = config.get("moe", {}) if isinstance(config.get("moe"), dict) else {}
+    budget = init_verification.get("parameter_budget_verification", {})
+    sparse_usage = eval_results_1024.get("val_tokens_per_expert") or pair_usage_1024.get("tokens_per_expert") or []
+    sparse_usage = [float(value) for value in sparse_usage] if isinstance(sparse_usage, list) else []
+    sparse_entropy, normalized_sparse_entropy = _distribution_entropy(sparse_usage) if sparse_usage else (None, None)
+    sparse_load_imbalance = float(max(sparse_usage) - min(sparse_usage)) if sparse_usage else None
+    dead_sparse_expert_count = int(sum(1 for value in sparse_usage if float(value) <= 1e-8)) if sparse_usage else None
+    return {
+        "moe_arch": moe_cfg.get("moe_arch", config.get("moe_arch", "shared_residual")),
+        "eval_name": eval_results_1024.get("eval_name", "formal_eval_1024"),
+        "eval_scope": eval_results_1024.get("eval_scope", "1024seq"),
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_source": eval_results_1024.get("checkpoint_source", str(checkpoint_path)),
+        "actual_num_sequences": eval_results_1024.get("actual_num_sequences"),
+        "actual_num_batches": eval_results_1024.get("actual_num_batches"),
+        "router_entropy": eval_results_1024.get("val_router_entropy", pair_usage_1024.get("router_entropy")),
+        "sparse_expert_usage": sparse_usage or None,
+        "sparse_expert_entropy": sparse_entropy,
+        "normalized_sparse_expert_entropy": normalized_sparse_entropy,
+        "sparse_load_imbalance": sparse_load_imbalance,
+        "dead_sparse_expert_count": dead_sparse_expert_count,
+        "shared_width": budget.get("resolved_shared_width"),
+        "sparse_expert_width": budget.get("sparse_expert_width"),
+        "num_sparse_experts": budget.get("num_sparse_experts"),
+        "active_sparse_experts": moe_cfg.get("sparse_top_k", moe_cfg.get("moe_sparse_top_k")),
+        "active_width": budget.get("active_width"),
+        "active_width_ratio_vs_dense": budget.get("active_width_ratio_vs_dense"),
+        "parameter_budget_delta": budget.get("delta_params"),
+        "parameter_budget_delta_percent": budget.get("delta_percent"),
+        "baseline_total_params": budget.get("baseline_total_params"),
+        "new_total_params": budget.get("new_total_params"),
+        "strict_total_param_fair_passed": budget.get("strict_total_param_fair_passed"),
+        "residual_scale_init": moe_cfg.get("residual_scale_init", moe_cfg.get("moe_residual_scale_init")),
+        "residual_scale_learnable": moe_cfg.get("residual_scale_learnable", moe_cfg.get("moe_residual_scale_learnable")),
+        "residual_scale_max": moe_cfg.get("residual_scale_max", moe_cfg.get("moe_residual_scale_max")),
+        "shared_output_norm": None,
+        "sparse_output_norm": None,
+        "final_output_norm": None,
+        "sparse_to_shared_norm_ratio": None,
+    }
+
+
 def build_training_report(
     config: Dict,
     init_verification: Dict,
@@ -368,15 +553,46 @@ def build_training_report(
     pair64: Dict,
     pair1024: Dict,
     extras: Dict[str, object],
+    output_dir: Path,
+    checkpoint_path: Path,
 ) -> Dict[str, object]:
     freeze_record = next((record for record in log_records if record.get("event") == "freeze"), {})
-    best_checkpoint_record = next((record for record in reversed(log_records) if record.get("event") == "checkpoint_best"), {})
+    best_checkpoint_record = next(
+        (
+            record
+            for record in reversed(log_records)
+            if record.get("event") in {"checkpoint_best_proxy", "checkpoint_best"}
+        ),
+        {},
+    )
+    last_checkpoint_record = next((record for record in reversed(log_records) if "checkpoint" in record), {})
+    dataset_manifest_train_path = output_dir / "dataset_manifest_train.json"
+    dataset_manifest_val_path = output_dir / "dataset_manifest_val.json"
+    train_manifest = load_json(dataset_manifest_train_path) if dataset_manifest_train_path.exists() else None
+    val_manifest = load_json(dataset_manifest_val_path) if dataset_manifest_val_path.exists() else None
+    proxy_eval_record = next(
+        (
+            record
+            for record in reversed(log_records)
+            if record.get("val_eval_name") == "proxy_val" or "proxy_val_loss" in record
+        ),
+        {},
+    )
+    group_names = [
+        entry.get("group_name")
+        for entry in freeze_record.get("optimizer_group_summary", [])
+        if entry.get("param_count", 0) > 0
+    ]
     return {
         "experiment_name": config.get("experiment_name"),
         "description": config.get("description"),
         "base_checkpoint_path": init_verification.get("pretrained_path"),
         "optimizer_resumed": False,
         "scheduler_resumed": False,
+        "loss_logging_version": "v2_normalized",
+        "train_loss_is_normalized": True,
+        "gradient_accumulation_steps": config.get("training", {}).get("gradient_accumulation_steps"),
+        "log_interval": config.get("training", {}).get("log_interval"),
         "preflight": {
             "total_params": init_verification.get("total_params"),
             "trainable_params": init_verification.get("trainable_params"),
@@ -394,6 +610,71 @@ def build_training_report(
             ),
             "freeze_record": freeze_record,
             "best_checkpoint_record": best_checkpoint_record,
+        },
+        "proxy_eval": {
+            "enabled": proxy_eval_record != {},
+            "eval_name": proxy_eval_record.get("val_eval_name", "proxy_val"),
+            "eval_scope": proxy_eval_record.get("val_eval_scope"),
+            "actual_num_sequences": proxy_eval_record.get("val_actual_num_sequences"),
+            "actual_num_batches": proxy_eval_record.get("val_actual_num_batches"),
+            "actual_num_tokens": proxy_eval_record.get("proxy_val_actual_num_tokens", proxy_eval_record.get("val_actual_num_tokens")),
+            "batch_size": proxy_eval_record.get("proxy_val_batch_size"),
+            "max_eval_batches": proxy_eval_record.get("proxy_val_max_eval_batches"),
+            "max_val_samples": proxy_eval_record.get("proxy_val_max_val_samples"),
+            "metric_for_checkpoint_best_proxy": "proxy_val_lm_loss",
+        },
+        "formal_eval_1024": {
+            "result_path": str(output_dir / "eval_results_1024.json"),
+            "checkpoint_source": str(checkpoint_path),
+            "actual_num_sequences": eval1024.get("actual_num_sequences"),
+            "actual_num_batches": eval1024.get("actual_num_batches"),
+            "actual_num_tokens": eval1024.get("actual_num_tokens"),
+        },
+        "checkpointing": {
+            "checkpoint_best_proxy_path": best_checkpoint_record.get("path", str(output_dir / "checkpoint_best_proxy")),
+            "checkpoint_best_proxy_step": best_checkpoint_record.get("step"),
+            "checkpoint_best_proxy_metric_name": "proxy_val_lm_loss",
+            "checkpoint_best_proxy_metric": best_checkpoint_record.get(
+                "best_proxy_val_lm_loss",
+                best_checkpoint_record.get("best_proxy_val_loss", best_checkpoint_record.get("best_val_loss")),
+            ),
+            "checkpoint_best_alias_behavior": best_checkpoint_record.get("checkpoint_best_alias_behavior", "legacy_checkpoint_best"),
+            "checkpoint_best_alias_name": "checkpoint_best",
+            "checkpoint_best_alias_target": "checkpoint_best_proxy",
+            "checkpoint_best_alias_path": best_checkpoint_record.get("checkpoint_best_alias", str(output_dir / "checkpoint_best")),
+            "checkpoint_last_path": last_checkpoint_record.get("checkpoint"),
+            "checkpoint_best_eval1024_path": None,
+            "checkpoint_best_eval1024_metric": None,
+            "checkpoint_best_eval1024_step": None,
+        },
+        "lr_logging": {
+            "logged_group_lrs": True,
+            "group_names": group_names,
+        },
+        "optimizer_groups": {entry.get("group_name"): entry for entry in freeze_record.get("optimizer_group_summary", [])},
+        "moe_metrics_logging": {
+            "router_entropy": True,
+            "expert_usage": True,
+            "pair_usage": True,
+            "structure_specific_metrics": [
+                "strict_complement_pair_fraction",
+                "non_complement_pair_fraction",
+                "free_expert_usage",
+                "base_output_norm",
+                "free_output_norm",
+                "final_output_norm",
+                "active_width_ratio",
+                "shared_output_norm",
+                "sparse_output_norm",
+                "sparse_to_shared_norm_ratio",
+                "residual_scale",
+            ],
+        },
+        "dataset_manifests": {
+            "train": str(dataset_manifest_train_path) if dataset_manifest_train_path.exists() else None,
+            "val": str(dataset_manifest_val_path) if dataset_manifest_val_path.exists() else None,
+            "train_payload": train_manifest,
+            "val_payload": val_manifest,
         },
         "eval_results": {
             "eval_results_64": eval64,
@@ -425,7 +706,12 @@ def main() -> None:
     moe_layer_indices = list(config.get("moe", {}).get("layer_indices", list(range(12, 24))))
     training_cfg = config.get("training", {})
     device = ensure_cuda_device(args.device)
-    checkpoint_path = args.checkpoint_path or (args.output_dir / "checkpoint_best")
+    checkpoint_path = args.checkpoint_path
+    if checkpoint_path is None:
+        if (args.output_dir / "checkpoint_best_proxy").exists():
+            checkpoint_path = args.output_dir / "checkpoint_best_proxy"
+        else:
+            checkpoint_path = args.output_dir / "checkpoint_best"
     if not checkpoint_path.exists():
         raise SystemExit(f"Checkpoint not found: {checkpoint_path}")
 
@@ -433,7 +719,7 @@ def main() -> None:
     text_field = training_cfg.get("text_field", "text")
     max_length = training_cfg.get("max_length", 2048)
 
-    eval_loader_64 = build_loader(
+    eval_loader_64, eval_manifest_64 = build_loader(
         data_source=args.val_data_source,
         tokenizer_path=args.tokenizer_path,
         max_length=max_length,
@@ -441,11 +727,29 @@ def main() -> None:
         batch_size=4,
         max_samples=None,
     )
-    eval_args_64 = type("EvalArgs", (), {"precision": args.precision, "max_eval_batches": 64, "use_moe": True})()
+    eval_args_64 = type(
+        "EvalArgs",
+        (),
+        {
+            "precision": args.precision,
+            "max_eval_batches": 64,
+            "use_moe": True,
+            "eval_name": "formal_eval_64",
+            "eval_scope": "64batch",
+            "batch_size": 4,
+            "max_val_samples": None,
+            "data_source": args.val_data_source,
+            "split": "validation",
+            "checkpoint_source": str(checkpoint_path),
+            "eval_seed": config.get("seed"),
+            "eval_file_list": eval_manifest_64.get("first_20_files"),
+            "eval_file_count": eval_manifest_64.get("file_count"),
+        },
+    )()
     eval_results_64 = evaluate(model, eval_loader_64, device, eval_args_64)
     write_json(args.output_dir / "eval_results_64.json", eval_results_64)
 
-    eval_loader_1024 = build_loader(
+    eval_loader_1024, eval_manifest_1024 = build_loader(
         data_source=args.val_data_source,
         tokenizer_path=args.tokenizer_path,
         max_length=max_length,
@@ -453,7 +757,25 @@ def main() -> None:
         batch_size=4,
         max_samples=1024,
     )
-    eval_args_1024 = type("EvalArgs", (), {"precision": args.precision, "max_eval_batches": None, "use_moe": True})()
+    eval_args_1024 = type(
+        "EvalArgs",
+        (),
+        {
+            "precision": args.precision,
+            "max_eval_batches": None,
+            "use_moe": True,
+            "eval_name": "formal_eval_1024",
+            "eval_scope": "1024seq",
+            "batch_size": 4,
+            "max_val_samples": 1024,
+            "data_source": args.val_data_source,
+            "split": "validation",
+            "checkpoint_source": str(checkpoint_path),
+            "eval_seed": config.get("seed"),
+            "eval_file_list": eval_manifest_1024.get("first_20_files"),
+            "eval_file_count": eval_manifest_1024.get("file_count"),
+        },
+    )()
     eval_results_1024 = evaluate(model, eval_loader_1024, device, eval_args_1024)
     write_json(args.output_dir / "eval_results_1024.json", eval_results_1024)
 
@@ -469,6 +791,9 @@ def main() -> None:
             "max_samples": None,
             "max_length": max_length,
             "precision": args.precision,
+            "eval_name": "formal_eval_64",
+            "eval_scope": "64batch",
+            "eval_file_count": eval_manifest_64.get("file_count"),
         }
     )
     write_json(args.output_dir / "pair_usage_64.json", pair_usage_64)
@@ -485,6 +810,9 @@ def main() -> None:
             "max_samples": 1024,
             "max_length": max_length,
             "precision": args.precision,
+            "eval_name": "formal_eval_1024",
+            "eval_scope": "1024seq",
+            "eval_file_count": eval_manifest_1024.get("file_count"),
         }
     )
     write_json(args.output_dir / "pair_usage_1024.json", pair_usage_1024)
@@ -496,6 +824,17 @@ def main() -> None:
     elif routing_mode == "complement_pair_plus_free":
         free_expert_usage = build_free_expert_usage_payload(pair_usage_1024)
         write_json(args.output_dir / "free_expert_usage_1024.json", free_expert_usage)
+
+    moe_arch = config.get("moe", {}).get("moe_arch", config.get("moe_arch", "standard"))
+    if moe_arch == "shared_residual":
+        shared_residual_metrics = build_shared_residual_metrics_payload(
+            config=config,
+            init_verification=init_verification,
+            eval_results_1024=eval_results_1024,
+            pair_usage_1024=pair_usage_1024,
+            checkpoint_path=checkpoint_path,
+        )
+        write_json(args.output_dir / "shared_residual_metrics_1024.json", shared_residual_metrics)
 
     ternary_ratios = compute_ternary_ratios(model, moe_layer_indices)
     write_json(args.output_dir / "ternary_ratios.json", ternary_ratios)
@@ -511,7 +850,11 @@ def main() -> None:
         write_json(similarity_history_path, similarity_history)
     write_json(args.output_dir / "similarity_curve.json", similarity_history)
 
-    loss_curve = build_loss_curve(log_records)
+    loss_curve = build_loss_curve(
+        log_records,
+        eval1024=eval_results_1024,
+        formal_checkpoint_source=str(checkpoint_path),
+    )
     write_json(args.output_dir / "loss_curve.json", loss_curve)
 
     extras: Dict[str, object] = {}
@@ -537,6 +880,8 @@ def main() -> None:
             **extras,
             "final_expert_metrics_summary": final_monitor.get("summary"),
         },
+        output_dir=args.output_dir,
+        checkpoint_path=checkpoint_path,
     )
     write_json(args.output_dir / "training_report.json", training_report)
     print(json.dumps({"status": "ok", "output_dir": str(args.output_dir)}, ensure_ascii=False))

@@ -22,6 +22,7 @@ from mmfreelm.models.hgrn_bit.configuration_hgrn_bit import HGRNBitConfig
 from mmfreelm.models.utils import RecurrentCache
 from mmfreelm.modules import FusedCrossEntropyLoss, RMSNorm, SparseMoEBlock
 from mmfreelm.modules.activations import swiglu
+from mmfreelm.modules.moe import SharedResidualMoEBlock
 #from mmfreelm.ops.bitnet import BitLinear_Fuse as BitLinear
 from mmfreelm.ops.fusedbitnet import FusedBitLinear as BitLinear
 
@@ -99,35 +100,55 @@ class HGRNBitBlock(nn.Module):
         moe_layer_indices = set(getattr(config, "moe_layer_indices", []) or [])
         self.use_moe = bool(config.use_moe and (not moe_layer_indices or layer_idx in moe_layer_indices))
         if self.use_moe:
-            self.mlp = SparseMoEBlock(
-                hidden_size=config.hidden_size,
-                hidden_ratio=config.hidden_ratio,
-                intermediate_size=config.intermediate_size,
-                num_experts=config.moe_num_experts,
-                top_k=config.moe_num_experts_per_tok,
-                quantized_experts=config.moe_use_quantized_experts,
-                expert_intermediate_factor=getattr(config, "moe_expert_intermediate_factor", 1.0),
-                expert_intermediate_size=getattr(config, "moe_expert_intermediate_size", None),
-                router_bias=config.moe_router_bias,
-                router_jitter_noise=config.moe_router_jitter_noise,
-                normalize_topk_prob=config.moe_normalize_topk_prob,
-                grouped_topk=getattr(config, "moe_grouped_topk", False),
-                num_virtual_groups=getattr(config, "moe_num_virtual_groups", 1),
-                topk_per_group=getattr(config, "moe_topk_per_group", 1),
-                routing_mode=getattr(config, "moe_routing_mode", "standard"),
-                pair_weights=getattr(config, "moe_pair_weights", "router"),
-                complement_pairs=getattr(config, "moe_complement_pairs", None),
-                output_scale=getattr(config, "moe_output_scale", 1.0),
-                coverage_penalty_lambda=getattr(config, "moe_coverage_penalty_lambda", 0.0),
-                free_expert_scale=getattr(config, "moe_free_expert_scale", 0.5),
-                free_expert_exclude_pair_experts=getattr(config, "moe_free_expert_exclude_pair_experts", True),
-                enable_learnable_output_scale=getattr(config, "moe_enable_learnable_output_scale", False),
-                output_scale_granularity=getattr(config, "moe_output_scale_granularity", "global"),
-                initial_output_scale=getattr(config, "moe_initial_output_scale", getattr(config, "moe_output_scale", 1.0)),
-            )
-            expert_group_assignments = getattr(config, "moe_expert_group_assignments", None)
-            if expert_group_assignments:
-                self.mlp.router.configure_expert_group_assignments(expert_group_assignments)
+            if getattr(config, "moe_arch", "standard") == "shared_residual":
+                self.mlp = SharedResidualMoEBlock(
+                    hidden_size=config.hidden_size,
+                    hidden_ratio=config.hidden_ratio,
+                    intermediate_size=config.intermediate_size,
+                    shared_intermediate_size=getattr(config, "moe_shared_intermediate_size", config.intermediate_size),
+                    enable_sparse_residual=getattr(config, "moe_enable_sparse_residual", True),
+                    num_sparse_experts=getattr(config, "moe_num_experts", 4),
+                    sparse_top_k=getattr(config, "moe_sparse_top_k", 1),
+                    sparse_expert_width=getattr(config, "moe_sparse_expert_width", 128),
+                    quantized_experts=config.moe_use_quantized_experts,
+                    router_bias=config.moe_router_bias,
+                    router_jitter_noise=config.moe_router_jitter_noise,
+                    normalize_topk_prob=config.moe_normalize_topk_prob,
+                    residual_scale_init=getattr(config, "moe_residual_scale_init", 0.1),
+                    residual_scale_learnable=getattr(config, "moe_residual_scale_learnable", True),
+                    residual_scale_max=getattr(config, "moe_residual_scale_max", 0.5),
+                    dense_intermediate_size=getattr(config, "intermediate_size", None),
+                )
+            else:
+                self.mlp = SparseMoEBlock(
+                    hidden_size=config.hidden_size,
+                    hidden_ratio=config.hidden_ratio,
+                    intermediate_size=config.intermediate_size,
+                    num_experts=config.moe_num_experts,
+                    top_k=config.moe_num_experts_per_tok,
+                    quantized_experts=config.moe_use_quantized_experts,
+                    expert_intermediate_factor=getattr(config, "moe_expert_intermediate_factor", 1.0),
+                    expert_intermediate_size=getattr(config, "moe_expert_intermediate_size", None),
+                    router_bias=config.moe_router_bias,
+                    router_jitter_noise=config.moe_router_jitter_noise,
+                    normalize_topk_prob=config.moe_normalize_topk_prob,
+                    grouped_topk=getattr(config, "moe_grouped_topk", False),
+                    num_virtual_groups=getattr(config, "moe_num_virtual_groups", 1),
+                    topk_per_group=getattr(config, "moe_topk_per_group", 1),
+                    routing_mode=getattr(config, "moe_routing_mode", "standard"),
+                    pair_weights=getattr(config, "moe_pair_weights", "router"),
+                    complement_pairs=getattr(config, "moe_complement_pairs", None),
+                    output_scale=getattr(config, "moe_output_scale", 1.0),
+                    coverage_penalty_lambda=getattr(config, "moe_coverage_penalty_lambda", 0.0),
+                    free_expert_scale=getattr(config, "moe_free_expert_scale", 0.5),
+                    free_expert_exclude_pair_experts=getattr(config, "moe_free_expert_exclude_pair_experts", True),
+                    enable_learnable_output_scale=getattr(config, "moe_enable_learnable_output_scale", False),
+                    output_scale_granularity=getattr(config, "moe_output_scale_granularity", "global"),
+                    initial_output_scale=getattr(config, "moe_initial_output_scale", getattr(config, "moe_output_scale", 1.0)),
+                )
+                expert_group_assignments = getattr(config, "moe_expert_group_assignments", None)
+                if expert_group_assignments and getattr(self.mlp, "router", None) is not None:
+                    self.mlp.router.configure_expert_group_assignments(expert_group_assignments)
         else:
             self.mlp = HGRNBitMLP(
                 hidden_size=config.hidden_size,

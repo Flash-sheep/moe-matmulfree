@@ -90,6 +90,12 @@ def concat_quantized_weight_tensors(module) -> torch.Tensor:
 
 
 def pairwise_cosine(vectors: List[torch.Tensor]) -> Dict[str, float]:
+    if len(vectors) < 2:
+        return {
+            "mean": None,
+            "min": None,
+            "max": None,
+        }
     sims = []
     for lhs_idx, rhs_idx in combinations(range(len(vectors)), 2):
         lhs = vectors[lhs_idx]
@@ -128,6 +134,12 @@ def compute_hamming_vs_dense(expert, dense_mlp) -> Dict[str, float]:
         if dense_q.shape != expert_q.shape:
             continue
         distances.append(float((dense_q != expert_q).float().mean().item()))
+    if not distances:
+        return {
+            "mean": None,
+            "min": None,
+            "max": None,
+        }
     dist_tensor = torch.tensor(distances, dtype=torch.float32)
     return {
         "mean": float(dist_tensor.mean().item()),
@@ -149,6 +161,11 @@ def router_probe(model, moe_layer_indices: List[int], dataloader: DataLoader, de
     }
     if moe_layer_indices:
         first_router = model.model.layers[moe_layer_indices[0]].mlp.router
+        if first_router is None:
+            probe["router_present"] = False
+            model.train()
+            return probe
+        probe["router_present"] = True
         probe_hidden = torch.randn(64, model.config.hidden_size, device=device, dtype=input_ids.dtype if input_ids.dtype.is_floating_point else torch.float32)
         probe_hidden = probe_hidden.float()
         _, _, _, topk_indices, route_info = first_router(probe_hidden)
@@ -260,8 +277,10 @@ def estimate_active_param_budget(model, moe_layer_indices: List[int], num_expert
     total_expert_params = 0
     params_per_expert = 0
     if moe_layer_indices:
-        first_expert = model.model.layers[moe_layer_indices[0]].mlp.experts[0]
-        params_per_expert = sum(param.numel() for param in first_expert.parameters())
+        first_layer_experts = model.model.layers[moe_layer_indices[0]].mlp.experts
+        if len(first_layer_experts) > 0:
+            first_expert = first_layer_experts[0]
+            params_per_expert = sum(param.numel() for param in first_expert.parameters())
     for layer_idx in moe_layer_indices:
         total_expert_params += sum(
             param.numel()
@@ -446,6 +465,21 @@ def main() -> None:
         enable_learnable_output_scale=moe_cfg.get("enable_learnable_moe_output_scale", False),
         output_scale_granularity=moe_cfg.get("scale_granularity", "global"),
         initial_moe_output_scale=moe_cfg.get("initial_moe_output_scale"),
+        moe_arch=moe_cfg.get("moe_arch", "standard"),
+        enable_sparse_residual=moe_cfg.get("enable_sparse_residual", True),
+        nominal_shared_width=moe_cfg.get("nominal_shared_width"),
+        auto_resolve_shared_width=moe_cfg.get("auto_resolve_shared_width", False),
+        min_shared_width=moe_cfg.get("min_shared_width", 2048),
+        shared_width_step=moe_cfg.get("shared_width_step", 16),
+        strict_total_param_fair=moe_cfg.get("strict_total_param_fair", False),
+        shared_init=moe_cfg.get("shared_init", "dense_prefix"),
+        sparse_init=moe_cfg.get("sparse_init", "random_ternary_matched"),
+        sparse_expert_width=moe_cfg.get("sparse_expert_width", 128),
+        sparse_top_k=moe_cfg.get("sparse_top_k", 1),
+        residual_scale_init=moe_cfg.get("residual_scale_init", 0.1),
+        residual_scale_learnable=moe_cfg.get("residual_scale_learnable", True),
+        residual_scale_max=moe_cfg.get("residual_scale_max", 0.5),
+        skip_param_budget_resolver=moe_cfg.get("skip_param_budget_resolver", False),
     )
     trainable_params, frozen_params = apply_freeze_for_upcycling(
         model=model,
@@ -473,6 +507,7 @@ def main() -> None:
         model=model,
         freeze_mode=freeze_mode,
         moe_lr=optimizer_hparams["moe_lr"],
+        shared_expert_lr=optimizer_hparams["shared_expert_lr"],
         backbone_lr=optimizer_hparams["backbone_lr"],
         norm_lr=optimizer_hparams["norm_lr"],
         embed_lr=optimizer_hparams["embed_lr"],
@@ -488,6 +523,10 @@ def main() -> None:
                 freeze_embeddings=freeze_cfg.get("freeze_embeddings", True),
                 freeze_lm_head=freeze_cfg.get("freeze_lm_head", True),
                 local_backbone_layer_indices=local_backbone_layer_indices,
+                require_moe_router=not (
+                    moe_cfg.get("moe_arch", "standard") == "shared_residual"
+                    and not moe_cfg.get("enable_sparse_residual", True)
+                ),
             )
         )
     warnings: List[str] = []
@@ -513,12 +552,18 @@ def main() -> None:
     for layer_idx in moe_layer_indices:
         source_mlp = source_model.model.layers[layer_idx].mlp
         moe_block = model.model.layers[layer_idx].mlp
-        latent_vectors = [concat_weight_tensors(expert) for expert in moe_block.experts]
-        ternary_vectors = [concat_quantized_weight_tensors(expert) for expert in moe_block.experts]
-        latent_stats = pairwise_cosine(latent_vectors)
-        ternary_stats = pairwise_cosine(ternary_vectors)
-        expert_zero = {f"expert_{idx}": compute_zero_ratio(expert) for idx, expert in enumerate(moe_block.experts)}
-        zero_ratio_values.extend([stats["mean"] for stats in expert_zero.values()])
+        experts = list(moe_block.experts)
+        if experts:
+            latent_vectors = [concat_weight_tensors(expert) for expert in experts]
+            ternary_vectors = [concat_quantized_weight_tensors(expert) for expert in experts]
+            latent_stats = pairwise_cosine(latent_vectors)
+            ternary_stats = pairwise_cosine(ternary_vectors)
+            expert_zero = {f"expert_{idx}": compute_zero_ratio(expert) for idx, expert in enumerate(experts)}
+            zero_ratio_values.extend([stats["mean"] for stats in expert_zero.values()])
+        else:
+            latent_stats = {"mean": None, "min": None, "max": None}
+            ternary_stats = {"mean": None, "min": None, "max": None}
+            expert_zero = {}
         layer_payload: Dict[str, object] = {
             "latent_cosine_similarity": latent_stats,
             "ternary_projected_similarity": ternary_stats,
@@ -526,12 +571,12 @@ def main() -> None:
         }
         if moe_cfg.get("expert_intermediate_factor", 1.0) == 1.0:
             layer_payload["ternary_hamming_vs_dense_quantized"] = {
-                f"expert_{idx}": compute_hamming_vs_dense(expert, source_mlp) for idx, expert in enumerate(moe_block.experts)
+                f"expert_{idx}": compute_hamming_vs_dense(expert, source_mlp) for idx, expert in enumerate(experts)
             }
         layers[f"layer_{layer_idx}"] = layer_payload
 
-    zero_ratio_avg = float(torch.tensor(zero_ratio_values, dtype=torch.float32).mean().item())
-    if zero_ratio_avg > 0.50 or zero_ratio_avg < 0.20:
+    zero_ratio_avg = None if not zero_ratio_values else float(torch.tensor(zero_ratio_values, dtype=torch.float32).mean().item())
+    if zero_ratio_avg is not None and (zero_ratio_avg > 0.50 or zero_ratio_avg < 0.20):
         issues.append(f"Ternary zero ratio out of expected range: {zero_ratio_avg:.4f}")
 
     trainable_mlp_norm_names = set(trainable_summary["trainable_moe_layer_rmsnorm_names"])
@@ -767,6 +812,12 @@ def main() -> None:
         json.dumps(optimizer_group_summary, ensure_ascii=False, indent=2, default=json_default) + "\n",
         encoding="utf-8",
     )
+    parameter_budget = getattr(model.config, "moe_parameter_budget_verification", None)
+    if parameter_budget is not None:
+        (args.output_path.parent / "parameter_budget_verification.json").write_text(
+            json.dumps(parameter_budget, ensure_ascii=False, indent=2, default=json_default) + "\n",
+            encoding="utf-8",
+        )
     args.output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 

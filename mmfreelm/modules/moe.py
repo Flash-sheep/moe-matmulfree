@@ -296,6 +296,126 @@ class ExpertMLP(nn.Module):
         return self.down_proj(swiglu(gate, value))
 
 
+def _split_gate_up_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    intermediate_size = weight.shape[0] // 2
+    return weight[:intermediate_size], weight[intermediate_size:]
+
+
+def compute_dense_channel_importance(source_mlp: nn.Module) -> torch.Tensor:
+    gate_weight, up_weight = _split_gate_up_weight(source_mlp.gate_proj.weight.detach().float())
+    down_weight = source_mlp.down_proj.weight.detach().float()
+    return gate_weight.norm(dim=1) + up_weight.norm(dim=1) + down_weight.norm(dim=0)
+
+
+def select_dense_channel_indices(
+    source_mlp: nn.Module,
+    target_width: int,
+    selection_mode: str = "dense_prefix",
+) -> torch.Tensor:
+    _, intermediate_size = _infer_intermediate_size_from_gate_proj(source_mlp.gate_proj.weight)
+    if not (0 < target_width <= intermediate_size):
+        raise ValueError(
+            f"target_width must be in (0, {intermediate_size}], got {target_width}."
+        )
+    if selection_mode == "dense_prefix":
+        return torch.arange(target_width, dtype=torch.long)
+    if selection_mode == "dense_top_channel":
+        importance = compute_dense_channel_importance(source_mlp)
+        topk = torch.topk(importance, k=target_width, largest=True).indices
+        return torch.sort(topk).values
+    raise ValueError(f"Unsupported shared selection_mode `{selection_mode}`.")
+
+
+def select_discarded_channel_indices(
+    source_mlp: nn.Module,
+    shared_channel_indices: torch.Tensor,
+    target_width: int,
+    selection_mode: str = "dense_discarded_channel_split",
+) -> torch.Tensor:
+    _, intermediate_size = _infer_intermediate_size_from_gate_proj(source_mlp.gate_proj.weight)
+    shared_channel_indices = shared_channel_indices.detach().long().cpu()
+    if selection_mode != "dense_discarded_channel_split":
+        raise ValueError(f"Unsupported discarded selection_mode `{selection_mode}`.")
+    if not (0 <= target_width <= intermediate_size):
+        raise ValueError(
+            f"target_width must be in [0, {intermediate_size}], got {target_width}."
+        )
+    all_indices = torch.arange(intermediate_size, dtype=torch.long)
+    keep_mask = torch.ones(intermediate_size, dtype=torch.bool)
+    keep_mask[shared_channel_indices] = False
+    discarded_indices = all_indices[keep_mask]
+    if target_width > discarded_indices.numel():
+        raise ValueError(
+            f"Insufficient discarded channels for `{selection_mode}`: need {target_width}, "
+            f"but only {discarded_indices.numel()} remain after selecting {shared_channel_indices.numel()} shared channels."
+        )
+    if target_width == 0:
+        return discarded_indices[:0]
+    importance = compute_dense_channel_importance(source_mlp).detach().float().cpu()
+    discarded_importance = importance.index_select(0, discarded_indices)
+    topk_local = torch.topk(discarded_importance, k=target_width, largest=True).indices
+    return discarded_indices.index_select(0, topk_local)
+
+
+def split_channel_indices_for_sparse_experts(
+    selected_channel_indices: torch.Tensor,
+    num_experts: int,
+    expert_width: int,
+) -> List[torch.Tensor]:
+    expected = int(num_experts) * int(expert_width)
+    if int(selected_channel_indices.numel()) != expected:
+        raise ValueError(
+            f"Expected {expected} selected channels for {num_experts} experts x {expert_width} width, "
+            f"got {selected_channel_indices.numel()}."
+        )
+    chunks: List[torch.Tensor] = []
+    for expert_idx in range(int(num_experts)):
+        start = expert_idx * int(expert_width)
+        end = start + int(expert_width)
+        chunks.append(torch.sort(selected_channel_indices[start:end].detach().long().cpu()).values)
+    return chunks
+
+
+def _infer_intermediate_size_from_gate_proj(weight: torch.Tensor) -> Tuple[int, int]:
+    hidden_size = weight.shape[1]
+    intermediate_size = weight.shape[0] // 2
+    return hidden_size, intermediate_size
+
+
+def initialize_shared_expert_from_dense(
+    shared_expert: ExpertMLP,
+    source_mlp: nn.Module,
+    channel_indices: torch.Tensor,
+) -> None:
+    channel_indices = channel_indices.detach().long().cpu()
+    source_state = source_mlp.state_dict()
+    source_gate_weight, source_up_weight = _split_gate_up_weight(source_state["gate_proj.weight"].detach().float())
+    source_down_weight = source_state["down_proj.weight"].detach().float()
+    selected_gate = source_gate_weight.index_select(0, channel_indices)
+    selected_up = source_up_weight.index_select(0, channel_indices)
+    selected_down = source_down_weight.index_select(1, channel_indices)
+    target_state = shared_expert.state_dict()
+    target_state["gate_proj.weight"] = torch.cat([selected_gate, selected_up], dim=0).to(
+        target_state["gate_proj.weight"].dtype
+    )
+    target_state["down_proj.weight"] = selected_down.to(target_state["down_proj.weight"].dtype)
+    for key in ("gate_proj.norm.weight", "gate_proj.norm.bias"):
+        if key in source_state and key in target_state:
+            target_state[key] = source_state[key].detach().to(target_state[key].dtype)
+    for key in ("down_proj.norm.weight", "down_proj.norm.bias"):
+        if key in source_state and key in target_state:
+            target_state[key] = source_state[key].detach().index_select(0, channel_indices).to(target_state[key].dtype)
+    shared_expert.load_state_dict(target_state, strict=False)
+
+
+def initialize_sparse_expert_from_dense(
+    sparse_expert: ExpertMLP,
+    source_mlp: nn.Module,
+    channel_indices: torch.Tensor,
+) -> None:
+    initialize_shared_expert_from_dense(sparse_expert, source_mlp, channel_indices)
+
+
 def build_expert_from_mlp_state(
     moe_block,
     source_mlp,
@@ -637,4 +757,250 @@ class SparseMoEBlock(nn.Module):
 
         output.index_copy_(0, active_indices, mixed_output)
         router_logits_out = router_logits if output_router_logits else None
+        return output.reshape(original_shape), aux_loss, router_logits_out, metrics
+
+
+class SharedResidualMoEBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        hidden_ratio: Optional[int],
+        intermediate_size: Optional[int],
+        shared_intermediate_size: int,
+        enable_sparse_residual: bool = True,
+        num_sparse_experts: int = 4,
+        sparse_top_k: int = 1,
+        sparse_expert_width: int = 128,
+        quantized_experts: bool = False,
+        router_bias: bool = False,
+        router_jitter_noise: float = 0.0,
+        normalize_topk_prob: bool = True,
+        residual_scale_init: float = 0.1,
+        residual_scale_learnable: bool = True,
+        residual_scale_max: float = 0.5,
+        dense_intermediate_size: Optional[int] = None,
+        parameter_budget_delta: float = 0.0,
+    ) -> None:
+        super().__init__()
+        _, base_intermediate_size = _resolve_intermediate_size(hidden_size, hidden_ratio, intermediate_size)
+        self.hidden_size = hidden_size
+        self.intermediate_size = int(dense_intermediate_size or base_intermediate_size)
+        self.shared_intermediate_size = int(shared_intermediate_size)
+        self.enable_sparse_residual = bool(enable_sparse_residual)
+        self.num_sparse_experts = int(num_sparse_experts if enable_sparse_residual else 0)
+        self.top_k = int(sparse_top_k if enable_sparse_residual else 0)
+        self.sparse_expert_width = int(sparse_expert_width if enable_sparse_residual else 0)
+        self.quantized_experts = bool(quantized_experts)
+        self.residual_scale_init = float(residual_scale_init)
+        self.residual_scale_learnable = bool(residual_scale_learnable and self.enable_sparse_residual)
+        self.residual_scale_max = float(residual_scale_max)
+        self.parameter_budget_delta = float(parameter_budget_delta)
+        self.shared_expert = ExpertMLP(
+            hidden_size=hidden_size,
+            hidden_ratio=hidden_ratio,
+            intermediate_size=self.shared_intermediate_size,
+            quantized=quantized_experts,
+        )
+        if self.enable_sparse_residual and self.num_sparse_experts > 0:
+            self.router = TopKRouter(
+                hidden_size=hidden_size,
+                num_experts=self.num_sparse_experts,
+                top_k=max(self.top_k, 1),
+                bias=router_bias,
+                jitter_noise=router_jitter_noise,
+                normalize_topk_prob=normalize_topk_prob,
+                routing_mode="standard",
+            )
+            self.sparse_experts = nn.ModuleList(
+                [
+                    ExpertMLP(
+                        hidden_size=hidden_size,
+                        hidden_ratio=hidden_ratio,
+                        intermediate_size=self.sparse_expert_width,
+                        quantized=quantized_experts,
+                    )
+                    for _ in range(self.num_sparse_experts)
+                ]
+            )
+        else:
+            self.router = None
+            self.sparse_experts = nn.ModuleList([])
+        if self.residual_scale_learnable:
+            init_fraction = min(max(self.residual_scale_init / max(self.residual_scale_max, 1e-8), 1e-4), 1 - 1e-4)
+            raw_scale_init = math.log(init_fraction / (1.0 - init_fraction))
+            self.raw_residual_scale = nn.Parameter(torch.tensor(raw_scale_init, dtype=torch.float32))
+        else:
+            self.register_parameter("raw_residual_scale", None)
+            self.register_buffer(
+                "fixed_residual_scale",
+                torch.tensor(float(self.residual_scale_init), dtype=torch.float32),
+                persistent=True,
+            )
+        self.shared_channel_indices: Optional[List[int]] = None
+        self.sparse_channel_indices: List[int] = []
+        self.sparse_expert_channel_assignments: Dict[str, List[int]] = {}
+        self.shared_init_method: Optional[str] = None
+        self.sparse_init_method: Optional[str] = None
+
+    @property
+    def experts(self) -> nn.ModuleList:
+        return self.sparse_experts
+
+    @property
+    def active_width(self) -> int:
+        return int(self.shared_intermediate_size + max(self.top_k, 0) * self.sparse_expert_width)
+
+    @property
+    def active_width_ratio_vs_dense(self) -> float:
+        return float(self.active_width) / float(max(self.intermediate_size, 1))
+
+    def current_residual_scale(self) -> torch.Tensor:
+        if self.residual_scale_learnable and self.raw_residual_scale is not None:
+            return self.residual_scale_max * torch.sigmoid(self.raw_residual_scale)
+        return self.fixed_residual_scale
+
+    def _empty_metrics(self, device: torch.device) -> Dict[str, torch.Tensor]:
+        zeros = torch.zeros(self.num_sparse_experts, device=device)
+        return {
+            "tokens_per_expert": zeros,
+            "expert_usage": zeros,
+            "router_prob_per_expert": zeros,
+            "router_entropy": torch.tensor(0.0, device=device),
+            "route_load": zeros,
+            "active_tokens": torch.tensor(0.0, device=device),
+            "sparse_expert_entropy": torch.tensor(0.0, device=device),
+            "normalized_sparse_expert_entropy": torch.tensor(0.0, device=device),
+            "sparse_load_imbalance": torch.tensor(0.0, device=device),
+            "dead_sparse_expert_count": torch.tensor(float(self.num_sparse_experts), device=device),
+            "shared_width": torch.tensor(float(self.shared_intermediate_size), device=device),
+            "sparse_expert_width": torch.tensor(float(self.sparse_expert_width), device=device),
+            "num_sparse_experts": torch.tensor(float(self.num_sparse_experts), device=device),
+            "active_sparse_experts": torch.tensor(float(self.top_k), device=device),
+            "active_width": torch.tensor(float(self.active_width), device=device),
+            "active_width_ratio_vs_dense": torch.tensor(float(self.active_width_ratio_vs_dense), device=device),
+            "residual_scale": self.current_residual_scale().detach().to(device),
+            "parameter_budget_delta": torch.tensor(self.parameter_budget_delta, device=device),
+        }
+
+    def _build_sparse_router_metrics(
+        self,
+        router_probs: torch.Tensor,
+        topk_indices: torch.Tensor,
+        num_active_tokens: int,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        assignment_mask = F.one_hot(topk_indices, num_classes=self.num_sparse_experts).sum(dim=1).clamp(max=1)
+        assignment_mask = assignment_mask.to(router_probs.dtype)
+        tokens_per_expert = assignment_mask.mean(dim=0)
+        router_prob_per_expert = router_probs.mean(dim=0)
+        router_entropy = (-router_probs.clamp_min(1e-9) * router_probs.clamp_min(1e-9).log()).sum(dim=-1).mean()
+        route_load = F.one_hot(topk_indices.reshape(-1), num_classes=self.num_sparse_experts).to(router_probs.dtype).sum(dim=0)
+        aux_loss = self.num_sparse_experts * torch.sum(tokens_per_expert * router_prob_per_expert)
+        safe_fraction = tokens_per_expert.clamp_min(1e-9)
+        sparse_entropy = -(safe_fraction * safe_fraction.log()).sum()
+        normalized_entropy = (
+            sparse_entropy / math.log(max(self.num_sparse_experts, 2))
+            if self.num_sparse_experts > 1
+            else torch.tensor(0.0, device=router_probs.device)
+        )
+        return aux_loss, {
+            "tokens_per_expert": tokens_per_expert.detach(),
+            "expert_usage": tokens_per_expert.detach(),
+            "router_prob_per_expert": router_prob_per_expert.detach(),
+            "router_entropy": router_entropy.detach(),
+            "route_load": route_load.detach(),
+            "active_tokens": torch.tensor(float(num_active_tokens), device=router_probs.device),
+            "sparse_expert_entropy": sparse_entropy.detach(),
+            "normalized_sparse_expert_entropy": normalized_entropy.detach(),
+            "sparse_load_imbalance": (tokens_per_expert.max() - tokens_per_expert.min()).detach(),
+            "dead_sparse_expert_count": torch.tensor(
+                float((tokens_per_expert <= 1e-8).sum().item()),
+                device=router_probs.device,
+            ),
+        }
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_router_logits: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        original_shape = hidden_states.shape
+        flat_hidden = hidden_states.reshape(-1, self.hidden_size)
+        output = flat_hidden.new_zeros(flat_hidden.shape)
+        if attention_mask is None:
+            active_mask = torch.ones(flat_hidden.shape[0], dtype=torch.bool, device=flat_hidden.device)
+        else:
+            active_mask = attention_mask.reshape(-1).to(torch.bool)
+        active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
+        if active_indices.numel() == 0:
+            zero = flat_hidden.new_zeros(())
+            return output.reshape(original_shape), zero, None, self._empty_metrics(flat_hidden.device)
+
+        active_hidden = flat_hidden.index_select(0, active_indices)
+        shared_output = self.shared_expert(active_hidden)
+        metrics = self._empty_metrics(active_hidden.device)
+        metrics.update(
+            {
+                "shared_output_norm": shared_output.float().norm(dim=-1).mean().detach(),
+                "shared_width": torch.tensor(float(self.shared_intermediate_size), device=active_hidden.device),
+                "active_width": torch.tensor(float(self.active_width), device=active_hidden.device),
+                "active_width_ratio_vs_dense": torch.tensor(
+                    float(self.active_width_ratio_vs_dense),
+                    device=active_hidden.device,
+                ),
+            }
+        )
+        aux_loss = active_hidden.new_zeros(())
+        sparse_output = active_hidden.new_zeros(active_hidden.shape)
+        router_logits_out = None
+        if self.enable_sparse_residual and self.router is not None and self.num_sparse_experts > 0:
+            router_logits, router_probs, topk_weights, topk_indices, _ = self.router(active_hidden)
+            aux_loss, sparse_metrics = self._build_sparse_router_metrics(
+                router_probs=router_probs,
+                topk_indices=topk_indices,
+                num_active_tokens=active_hidden.shape[0],
+            )
+            metrics.update(sparse_metrics)
+            for expert_idx, expert in enumerate(self.sparse_experts):
+                expert_assignments = (topk_indices == expert_idx).nonzero(as_tuple=False)
+                if expert_assignments.numel() == 0:
+                    continue
+                token_positions = expert_assignments[:, 0]
+                route_positions = expert_assignments[:, 1]
+                expert_input = active_hidden.index_select(0, token_positions)
+                expert_output = expert(expert_input)
+                expert_weight = topk_weights[token_positions, route_positions].unsqueeze(-1).to(expert_output.dtype)
+                sparse_output.index_add_(0, token_positions, expert_output * expert_weight)
+            residual_scale = self.current_residual_scale().to(sparse_output.dtype)
+            mixed_output = shared_output + residual_scale * sparse_output
+            metrics.update(
+                {
+                    "residual_scale": residual_scale.detach(),
+                    "sparse_output_norm": sparse_output.float().norm(dim=-1).mean().detach(),
+                    "final_output_norm": mixed_output.float().norm(dim=-1).mean().detach(),
+                    "sparse_to_shared_norm_ratio": (
+                        sparse_output.float().norm(dim=-1).mean()
+                        / shared_output.float().norm(dim=-1).mean().clamp_min(1e-8)
+                    ).detach(),
+                    "residual_scale_by_layer": residual_scale.detach(),
+                    "active_sparse_experts": torch.tensor(float(self.top_k), device=active_hidden.device),
+                    "num_sparse_experts": torch.tensor(float(self.num_sparse_experts), device=active_hidden.device),
+                    "sparse_expert_width": torch.tensor(float(self.sparse_expert_width), device=active_hidden.device),
+                }
+            )
+            router_logits_out = router_logits if output_router_logits else None
+        else:
+            mixed_output = shared_output
+            metrics.update(
+                {
+                    "residual_scale": torch.tensor(0.0, device=active_hidden.device),
+                    "shared_output_norm": shared_output.float().norm(dim=-1).mean().detach(),
+                    "sparse_output_norm": torch.tensor(0.0, device=active_hidden.device),
+                    "final_output_norm": shared_output.float().norm(dim=-1).mean().detach(),
+                    "sparse_to_shared_norm_ratio": torch.tensor(0.0, device=active_hidden.device),
+                    "active_sparse_experts": torch.tensor(0.0, device=active_hidden.device),
+                }
+            )
+
+        output.index_copy_(0, active_indices, mixed_output)
         return output.reshape(original_shape), aux_loss, router_logits_out, metrics
