@@ -1,0 +1,44 @@
+dataset_name: slimpajama_finewebedu_90_10_15b
+target_tokens: 15000000000
+seq_len: 1024
+seed: 202606
+tokenizer:
+  type: auto
+  path: auto_from_existing_project_config
+
+sources:
+  - name: slimpajama
+    ratio: 0.9
+    path: auto_detect_or_fill_me
+    split: train
+    text_field: text
+    metadata_fields:
+      domain: meta.redpajama_set_name
+    default_domain: unknown
+
+  - name: fineweb_edu
+    ratio: 0.1
+    hf_dataset: HuggingFaceFW/fineweb-edu
+    split: train
+    text_field: text
+    streaming: true
+    metadata_fields:
+      domain: domain
+    default_domain: edu_web
+
+packing:
+  enabled: false
+  drop_remainder: true
+  preserve_metadata: true
+
+output:
+  format: raw_text_parquet_with_metadata
+  shard_size_tokens: 100000000
+  write_manifest: true
+  write_domain_summary: true
+  write_source_summary: true
+  validation_tokens_per_domain: 131072
+
+safety:
+  overwrite: false
+  require_explicit_download_for_remote: true

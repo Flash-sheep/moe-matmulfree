@@ -11,7 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mmfreelm.modules.activations import swiglu
-from mmfreelm.ops.fusedbitnet import FusedBitLinear
+from mmfreelm.modules.layernorm import RMSNorm
+from mmfreelm.ops.fusedbitnet import FusedBitLinear, activation_quant
 
 
 def _resolve_intermediate_size(
@@ -280,14 +281,25 @@ class ExpertMLP(nn.Module):
         hidden_ratio: Optional[int] = None,
         intermediate_size: Optional[int] = None,
         quantized: bool = False,
+        expert_weight_bits: int = 2,
     ) -> None:
         super().__init__()
         _, intermediate_size = _resolve_intermediate_size(hidden_size, hidden_ratio, intermediate_size)
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        linear_cls = FusedBitLinear if quantized else nn.Linear
-        self.gate_proj = linear_cls(hidden_size, intermediate_size * 2, bias=False)
-        self.down_proj = linear_cls(intermediate_size, hidden_size, bias=False)
+        self.expert_weight_bits = int(expert_weight_bits)
+        linear_cls: type[nn.Module]
+        linear_kwargs: Dict[str, object] = {"bias": False}
+        if quantized:
+            if self.expert_weight_bits == 4:
+                linear_cls = FakeQuantizedLinear
+                linear_kwargs["num_bits"] = self.expert_weight_bits
+            else:
+                linear_cls = FusedBitLinear
+        else:
+            linear_cls = nn.Linear
+        self.gate_proj = linear_cls(hidden_size, intermediate_size * 2, **linear_kwargs)
+        self.down_proj = linear_cls(intermediate_size, hidden_size, **linear_kwargs)
         self.down_proj._is_residual_projection = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -299,6 +311,54 @@ class ExpertMLP(nn.Module):
 def _split_gate_up_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     intermediate_size = weight.shape[0] // 2
     return weight[:intermediate_size], weight[intermediate_size:]
+
+
+def quantize_weight_symmetric(weight: torch.Tensor, num_bits: int) -> torch.Tensor:
+    if num_bits < 2:
+        raise ValueError(f"num_bits must be >= 2, got {num_bits}.")
+    qmax = float((1 << (num_bits - 1)) - 1)
+    scale = qmax / weight.detach().abs().amax().clamp(min=1e-5)
+    return (weight * scale).round().clamp(-qmax, qmax) / scale
+
+
+def quantize_weight_symmetric_ste(weight: torch.Tensor, num_bits: int) -> torch.Tensor:
+    quantized = quantize_weight_symmetric(weight, num_bits=num_bits)
+    return weight + (quantized - weight).detach()
+
+
+class FakeQuantizedLinear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        num_bits: int = 4,
+        norm_eps: float = 1e-5,
+    ) -> None:
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.num_bits = int(num_bits)
+        self.norm = RMSNorm(self.in_features, eps=norm_eps)
+        self.weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(self.out_features))
+        else:
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(max(fan_in, 1))
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        normed = self.norm(hidden_states.to(self.weight.dtype))
+        quantized_hidden = activation_quant(normed)
+        quantized_weight = quantize_weight_symmetric_ste(self.weight, num_bits=self.num_bits)
+        return F.linear(quantized_hidden.to(quantized_weight.dtype), quantized_weight, self.bias)
 
 
 def compute_dense_channel_importance(source_mlp: nn.Module) -> torch.Tensor:
@@ -475,6 +535,7 @@ class SparseMoEBlock(nn.Module):
         num_experts: int,
         top_k: int,
         quantized_experts: bool = False,
+        expert_weight_bits: int = 2,
         expert_intermediate_factor: float = 1.0,
         expert_intermediate_size: Optional[int] = None,
         router_bias: bool = False,
@@ -493,18 +554,25 @@ class SparseMoEBlock(nn.Module):
         enable_learnable_output_scale: bool = False,
         output_scale_granularity: str = "global",
         initial_output_scale: float = 1.0,
+        moe_family: str = "standard",
+        enable_output_norm_logging: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.top_k = top_k
         self.quantized_experts = quantized_experts
+        self.expert_weight_bits = int(expert_weight_bits)
         _, base_intermediate_size = _resolve_intermediate_size(hidden_size, hidden_ratio, intermediate_size)
         if expert_intermediate_size is None:
             expert_intermediate_size = max(1, int(round(base_intermediate_size * float(expert_intermediate_factor))))
         self.intermediate_size = base_intermediate_size
         self.expert_intermediate_size = int(expert_intermediate_size)
         self.expert_intermediate_factor = float(expert_intermediate_factor)
+        self.total_expert_width = int(self.num_experts * self.expert_intermediate_size)
+        self.active_width = int(self.top_k * self.expert_intermediate_size)
+        self.total_width_ratio_vs_dense = float(self.total_expert_width / max(self.intermediate_size, 1))
+        self.active_width_ratio_vs_dense = float(self.active_width / max(self.intermediate_size, 1))
         self.grouped_topk = bool(grouped_topk)
         self.num_virtual_groups = int(num_virtual_groups)
         self.topk_per_group = int(topk_per_group)
@@ -521,6 +589,8 @@ class SparseMoEBlock(nn.Module):
         self.enable_learnable_output_scale = bool(enable_learnable_output_scale)
         self.output_scale_granularity = output_scale_granularity
         self.initial_output_scale = float(initial_output_scale)
+        self.moe_family = str(moe_family)
+        self.enable_output_norm_logging = bool(enable_output_norm_logging)
         if self.enable_learnable_output_scale:
             if self.initial_output_scale <= 0.0:
                 raise ValueError("Learnable output scale requires a strictly positive initial_output_scale.")
@@ -561,6 +631,7 @@ class SparseMoEBlock(nn.Module):
                     hidden_ratio=hidden_ratio,
                     intermediate_size=self.expert_intermediate_size,
                     quantized=quantized_experts,
+                    expert_weight_bits=self.expert_weight_bits,
                 )
                 for _ in range(num_experts)
             ]
@@ -756,6 +827,18 @@ class SparseMoEBlock(nn.Module):
             mixed_output = mixed_output * output_scale
 
         output.index_copy_(0, active_indices, mixed_output)
+        if self.enable_output_norm_logging:
+            metrics.update(
+                {
+                    "moe_input_norm": active_hidden.float().norm(dim=-1).mean().detach(),
+                    "moe_output_norm": mixed_output.float().norm(dim=-1).mean().detach(),
+                    "active_width": torch.tensor(float(self.active_width), device=router_probs.device),
+                    "total_expert_width": torch.tensor(float(self.total_expert_width), device=router_probs.device),
+                    "active_width_ratio_vs_dense": torch.tensor(float(self.active_width_ratio_vs_dense), device=router_probs.device),
+                    "total_width_ratio_vs_dense": torch.tensor(float(self.total_width_ratio_vs_dense), device=router_probs.device),
+                    "expert_weight_bits": torch.tensor(float(self.expert_weight_bits), device=router_probs.device),
+                }
+            )
         router_logits_out = router_logits if output_router_logits else None
         return output.reshape(original_shape), aux_loss, router_logits_out, metrics
 

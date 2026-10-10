@@ -1,0 +1,110 @@
+experiment:
+  name: dense_matmulfree_scratch_relaxed30b_single15b
+  purpose: reproduce_mmfreelm_370m_dense_scratch_on_relaxed_30b
+
+initialization:
+  from_scratch: true
+  seed: 20260721
+  pretrained_checkpoint: null
+  resume_checkpoint: null
+
+model:
+  architecture: original_dense_matmulfree
+  base_config_path: /home/storage/yjl/moe-matmulfree/checkpoints/MMfreeLM-370M
+  moe_enabled: false
+  four_bit_enabled: false
+  train_all_parameters: true
+
+data:
+  source: existing_relaxed_30b
+  path: /home/storage/yjl/matmulfreellm_assets/datasets/slimpajama_62b_venketh_relaxed_balanced_30b
+  dataset_manifest: /home/storage/yjl/matmulfreellm_assets/datasets/slimpajama_62b_venketh_relaxed_balanced_30b/dataset_manifest.json
+  tokenizer: /home/storage/yjl/moe-matmulfree/checkpoints/MMfreeLM-370M
+  split: train
+  text_field: text
+  sequence_length: 2048
+  num_workers: 0
+  data_seed: 20260721
+  shuffle_strategy: seeded_shard_permutation
+  exact_resume: true
+  deterministic_sharding: true
+  rebuild_dataset: false
+  labels_equal_input_ids: true
+
+validation:
+  path: /home/storage/yjl/matmulfreellm_assets/datasets/slimpajama_62b_venketh_stageB_pilot_validation_4096x2048_v2
+  manifest: /home/storage/yjl/matmulfreellm_assets/datasets/slimpajama_62b_venketh_stageB_pilot_validation_4096x2048_v2/validation_manifest.json
+  array: /home/storage/yjl/matmulfreellm_assets/datasets/slimpajama_62b_venketh_stageB_pilot_validation_4096x2048_v2/validation_sequences.npy
+  hashes: /home/storage/yjl/matmulfreellm_assets/datasets/slimpajama_62b_venketh_stageB_pilot_validation_4096x2048_v2/validation_sample_hashes.txt
+  full_sequences: 4096
+  proxy_sequences: 512
+  batch_size_per_rank: 2
+  full_token_milestones: [0, 100000000, 500000000, 1000000000, 3000000000, 6000000000, 10000000000, 15000000000]
+  proxy_token_milestones: [10000000, 50000000, 250000000, 750000000, 2000000000, 4500000000, 8000000000, 12500000000]
+
+distributed:
+  world_size: 1
+  backend: none
+  devices: [0]
+
+training:
+  micro_batch_size_per_rank: 2
+  gradient_accumulation_steps: 32
+  precision: bf16
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  epsilon: 1.0e-8
+  peak_learning_rate: 0.004
+  weight_decay: 0.01
+  warmup_steps: 500
+  grad_clip: 1.0
+  scheduler: cosine_with_midpoint_half
+  min_learning_rate: 0.0
+  planned_total_tokens: 15000000000
+  stage_stop_tokens: 15000000000
+  stage_stop_is_not_scheduler_horizon: false
+  log_interval_steps: 1
+  checksum_interval_steps: 1000
+  smoothed_loss_window: 100
+
+checkpoint:
+  save_model: true
+  save_optimizer: true
+  save_scheduler: true
+  save_rng: true
+  save_dataset_state: true
+  save_packing_state: true
+  rank_specific_dataset_state: true
+  milestone_tokens: [1000000000, 3000000000, 6000000000, 10000000000, 15000000000]
+  final_tokens: 15000000000
+
+monitoring:
+  activation_rms_enabled: true
+  automatic_warning_enabled: true
+  lightweight_interval_steps: 500
+  activation_snapshot_token_milestones:
+    [0, 1000000, 10000000, 50000000, 100000000, 250000000, 500000000, 750000000, 1000000000, 2000000000, 3000000000, 4500000000, 6000000000, 8000000000, 10000000000, 12500000000, 15000000000]
+  warn_last_residual_rms: 25.0
+  warn_snapshot_growth_ratio: 1.5
+  warn_last_first_ratio: 15.0
+  strong_warn_last_residual_rms: 50.0
+  strong_warn_consecutive_growth_ratio: 1.4
+  auto_stop_last_residual_rms: 100.0
+  auto_stop_on_non_finite: true
+
+output:
+  root_dir: /home/storage/yjl/moe-matmulfree/outputs
+
+runtime:
+  container_image: matmulfreellm:latest
+  triton_cache_dir_in_container: /tmp/triton-cache
+  cublas_workspace_config: ":4096:8"
+  python_hash_seed: 20260721
+
+reproducibility:
+  exact_data_sequence_resume: true
+  exact_optimizer_scheduler_token_resume: true
+  cross_process_parameter_trajectory_bitwise_deterministic: false
+  kernel_repeatability_note: fused HGRN and quantized STE kernels show bounded cross-process numerical drift across process restarts
+  training_resume_model_max_abs_tolerance: 0.05
+  training_resume_optimizer_max_abs_tolerance: 0.005

@@ -1,0 +1,40 @@
+dataset_name: slimpajama_62b_venketh_local
+target_tokens: 30000000000
+seq_len: 1024
+seed: 202606
+
+tokenizer:
+  type: auto
+  path: auto_from_existing_project_config
+
+sources:
+  - name: slimpajama_62b_venketh
+    ratio: 1.0
+    path: /home/storage/yjl/matmulfreellm_assets/datasets/SlimPajama-62B
+    split: train
+    text_field: text
+    metadata_fields:
+      domain: meta.redpajama_set_name
+    default_domain: unknown
+
+packing:
+  enabled: true
+  drop_remainder: true
+  preserve_metadata: true
+
+output:
+  format: raw_text_parquet_with_metadata
+  shard_size_tokens: 100000000
+  write_manifest: true
+  write_domain_summary: true
+  write_source_summary: true
+  validation_tokens_per_domain: 131072
+
+safety:
+  overwrite: false
+  require_explicit_download_for_remote: true
+
+source_provenance:
+  source_dataset: venketh/SlimPajama-62B
+  source_note: SlimPajama-62B subset uploaded by venketh; derived from SlimPajama chunk2
+  not_full_slimpajama_627b: true

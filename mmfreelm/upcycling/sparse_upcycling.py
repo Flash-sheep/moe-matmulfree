@@ -12,6 +12,7 @@ from mmfreelm.modules.moe import (
     build_expert_from_mlp_state,
     initialize_sparse_expert_from_dense,
     initialize_shared_expert_from_dense,
+    quantize_weight_symmetric,
     select_dense_channel_indices,
     select_discarded_channel_indices,
     split_channel_indices_for_sparse_experts,
@@ -43,6 +44,22 @@ def _infer_module_device_and_dtype(module: torch.nn.Module) -> tuple[torch.devic
     raise RuntimeError("Unable to infer device/dtype from source module: it has no parameters or buffers.")
 
 
+def _align_sparse_moe_master_weights_fp32(moe_block: SparseMoEBlock, original_mlp) -> None:
+    """Keep sparse-MoE trainable master weights in fp32 across variants.
+
+    Quantized expert paths in this codebase are fake-quant / STE training paths:
+    the forward uses quantized views, but the optimizer still updates floating-point
+    master weights. If one variant silently casts those masters to bf16 while another
+    keeps them in fp32, the comparison is no longer about quantization semantics alone.
+
+    We centralize the policy here so future sparse-MoE families inherit the same master
+    weight behavior by default instead of adding family-specific dtype drift.
+    """
+    source_device, _ = _infer_module_device_and_dtype(original_mlp.gate_proj)
+    moe_block.experts.to(device=source_device, dtype=torch.float32)
+    moe_block.router.to(device=source_device, dtype=torch.float32)
+
+
 def count_module_parameters(module) -> int:
     return sum(param.numel() for param in module.parameters())
 
@@ -72,6 +89,35 @@ def _collect_ternary_stats_from_experts(experts) -> Dict[str, object]:
                     "negative_ratio": negative_ratio,
                     "mean": float(param.detach().float().mean().item()),
                     "std": float(param.detach().float().std().item()),
+                }
+            )
+            zero_values.append(zero_ratio)
+        expert_stats[f"expert_{expert_idx}"] = layer_entries
+    return {
+        "experts": expert_stats,
+        "zero_ratio_avg": float(sum(zero_values) / max(len(zero_values), 1)),
+    }
+
+
+def _collect_nbit_stats_from_experts(experts, num_bits: int) -> Dict[str, object]:
+    expert_stats: Dict[str, object] = {}
+    zero_values = []
+    for expert_idx, expert in enumerate(experts):
+        layer_entries = []
+        for name, param in expert.named_parameters():
+            if "weight" not in name or param.ndim < 2:
+                continue
+            quantized = quantize_weight_symmetric(param.detach().float(), num_bits=num_bits)
+            total = max(quantized.numel(), 1)
+            zero_ratio = float((quantized == 0).sum().item() / total)
+            layer_entries.append(
+                {
+                    "name": name,
+                    "zero_ratio": zero_ratio,
+                    "mean": float(param.detach().float().mean().item()),
+                    "std": float(param.detach().float().std().item()),
+                    "min_quantized": float(quantized.min().item()),
+                    "max_quantized": float(quantized.max().item()),
                 }
             )
             zero_values.append(zero_ratio)
@@ -417,7 +463,11 @@ def build_shared_residual_parameter_budget_payload(
     }
 
 
-def _init_experts_random_ternary_matched(moe_block, noise_alpha: float | None = None):
+def _init_experts_random_ternary_matched(
+    moe_block,
+    noise_alpha: float | None = None,
+    down_proj_scale: float = 1.0,
+):
     """Initialize MoE experts with random weights matching ternary distribution.
 
     Target zero_ratio ≈ 0.37, pos/neg ≈ 0.315 each.
@@ -441,6 +491,9 @@ def _init_experts_random_ternary_matched(moe_block, noise_alpha: float | None = 
     # `round().clamp(-1, 1)`, so zero covers roughly the interval (-0.5, 0.5).
     # sigma≈1.05 yields P(|x|<0.5)≈0.36~0.37 for a zero-centered Gaussian.
     target_std = 1.05
+    down_proj_scale = float(down_proj_scale)
+    if not math.isfinite(down_proj_scale) or down_proj_scale <= 0.0:
+        raise ValueError(f"down_proj_scale must be finite and positive, got {down_proj_scale}.")
 
     for expert in moe_block.experts:
         for name, param in expert.named_parameters():
@@ -480,6 +533,108 @@ def _init_experts_random_ternary_matched(moe_block, noise_alpha: float | None = 
                     noise = torch.randn_like(param) * noise_alpha * target_std
                     param.data.add_(noise)
 
+    # Full scratch MoE needs the residual branch to start in the same regime as
+    # the dense model.  Keep this opt-in so existing upcycling experiments retain
+    # their historical initialization when the scale is left at 1.0.
+    if down_proj_scale != 1.0:
+        with torch.no_grad():
+            for expert in moe_block.experts:
+                expert.down_proj.weight.mul_(down_proj_scale)
+        print(f"[random_ternary_matched] expert down_proj init scale={down_proj_scale:.8g}")
+
+
+def _init_experts_random_4bit_partition(moe_block, noise_alpha: float | None = None):
+    """Initialize 4-bit fake-quant experts with a quantizer-matched scale.
+
+    The 4-bit path uses per-tensor symmetric fake quantization driven by the tensor
+    max-abs value. Using plain fan-in init (1/sqrt(fan_in)) keeps the floating-point
+    master weights extremely small, which in practice made the initial expert output
+    norms an order of magnitude weaker than the ternary baseline. That produces an
+    unfair optimization starting point rather than a meaningful bitwidth comparison.
+
+    We therefore use a fixed zero-centered Gaussian scale comparable to the ternary
+    random init so the initial expert branch has a similar output-norm regime, while
+    still letting the 4-bit fake-quantizer determine the effective discrete weights.
+    """
+    target_std = 1.0
+    for expert in moe_block.experts:
+        for name, param in expert.named_parameters():
+            if "norm" in name.lower():
+                param.data.fill_(1.0)
+                continue
+            if "weight" not in name:
+                param.data.zero_()
+                continue
+            if param.ndim < 2:
+                param.data.zero_()
+                continue
+            param.data.normal_(mean=0.0, std=target_std)
+            if noise_alpha is not None and noise_alpha > 0:
+                param.data.add_(torch.randn_like(param) * (noise_alpha * target_std))
+
+    first_expert = moe_block.experts[0]
+    for name, param in first_expert.named_parameters():
+        if "weight" not in name or param.ndim < 2:
+            continue
+        w = param.data.detach().float()
+        quantized = quantize_weight_symmetric(w, num_bits=4)
+        total = max(quantized.numel(), 1)
+        zero_r = float((quantized == 0).sum().item() / total)
+        used_levels = int(torch.unique(quantized).numel())
+        print(
+            f"[random_4bit_partition] expert_0 {name}: "
+            f"zero={zero_r:.4f} used_levels={used_levels} "
+            f"std={w.std().item():.4f} mean={w.mean().item():.4f} "
+            f"qmin={quantized.min().item():.4f} qmax={quantized.max().item():.4f}"
+        )
+
+
+def build_partition_4bit_parameter_budget_payload(
+    model,
+    *,
+    dense_width_budget: int,
+    dense_ffn_params_per_layer: int,
+    num_experts: int,
+    top_k: int,
+    expert_intermediate_size: int,
+    expert_weight_bits: int,
+    moe_family: str,
+    moe_block_params_per_layer: int,
+    router_params_per_layer: int,
+    expert_params_per_layer: int,
+) -> Dict[str, object]:
+    total_expert_width = int(num_experts) * int(expert_intermediate_size)
+    active_width = int(top_k) * int(expert_intermediate_size)
+    expert_param_delta_vs_dense_ffn = int(expert_params_per_layer - dense_ffn_params_per_layer)
+    expert_param_delta_ratio = float(expert_param_delta_vs_dense_ffn / max(dense_ffn_params_per_layer, 1))
+    return {
+        "moe_family": str(moe_family),
+        "num_experts": int(num_experts),
+        "expert_width": int(expert_intermediate_size),
+        "top_k": int(top_k),
+        "total_expert_width": int(total_expert_width),
+        "active_width": int(active_width),
+        "active_width_ratio_vs_dense": float(active_width / max(dense_width_budget, 1)),
+        "total_width_ratio_vs_dense": float(total_expert_width / max(dense_width_budget, 1)),
+        "expert_weight_bits": int(expert_weight_bits),
+        "dense_ffn_params_per_layer": int(dense_ffn_params_per_layer),
+        "expert_params_per_layer": int(expert_params_per_layer),
+        "router_params_per_layer": int(router_params_per_layer),
+        "moe_block_params_per_layer": int(moe_block_params_per_layer),
+        "expert_param_delta_vs_dense_ffn": int(expert_param_delta_vs_dense_ffn),
+        "expert_param_delta_ratio_vs_dense_ffn": float(expert_param_delta_ratio),
+        "parameter_count_fair_vs_dense_ffn": bool(abs(expert_param_delta_ratio) <= 0.01),
+        "bit_storage_fair_vs_ternary_dense": False,
+        "parameter_count_fair_note": "parameter-count fair, not bit-storage fair",
+        "width_budget_passed": bool(total_expert_width == int(dense_width_budget)),
+        "strict_total_param_fair_passed": bool(total_expert_width == int(dense_width_budget)),
+        "target_total_params": int(compute_baseline_param_count(model)),
+        "baseline_total_params": int(compute_baseline_param_count(model)),
+        "new_total_params": int(compute_baseline_param_count(model)),
+        "delta_params": 0,
+        "delta_percent": 0.0,
+    }
+
 
 def upcycle_dense_to_moe(
     model,
@@ -493,6 +648,7 @@ def upcycle_dense_to_moe(
     router_bias: bool = False,
     normalize_topk_prob: bool = True,
     expert_intermediate_factor: float = 1.0,
+    expert_intermediate_size: Optional[int] = None,
     init_method: str = "copy_noise",
     noise_alpha: float | None = None,
     noise_mode: str = "legacy_global_std",
@@ -523,11 +679,15 @@ def upcycle_dense_to_moe(
     residual_scale_learnable: bool = True,
     residual_scale_max: float = 0.5,
     skip_param_budget_resolver: bool = False,
+    moe_family: str = "standard",
+    expert_weight_bits: int = 2,
+    enable_output_norm_logging: bool = False,
 ):
     num_layers = len(model.model.layers)
     if not all(0 <= idx < num_layers for idx in moe_layer_indices):
         raise ValueError(f"`moe_layer_indices` must be within [0, {num_layers - 1}]")
 
+    baseline_total_params = compute_baseline_param_count(model)
     parameter_budget_payload: Optional[Dict[str, object]] = None
     expert_group_assignments = None
     expert_copy_group_assignments = None
@@ -617,7 +777,11 @@ def upcycle_dense_to_moe(
             block.mlp = moe_block
             block.use_moe = True
             continue
-        requested_expert_intermediate_size = max(1, int(round(intermediate_size * float(expert_intermediate_factor))))
+        requested_expert_intermediate_size = (
+            int(expert_intermediate_size)
+            if expert_intermediate_size is not None
+            else max(1, int(round(intermediate_size * float(expert_intermediate_factor))))
+        )
         if init_method == "partition":
             # Partition init requires non-overlapping row/column assignments, so each expert can
             # consume at most floor(intermediate_size / num_experts) channels from the dense MLP.
@@ -642,6 +806,7 @@ def upcycle_dense_to_moe(
             num_experts=num_experts,
             top_k=num_experts_per_tok,
             quantized_experts=use_quantized_experts,
+            expert_weight_bits=expert_weight_bits,
             expert_intermediate_factor=effective_expert_intermediate_factor,
             expert_intermediate_size=expert_intermediate_size,
             router_bias=router_bias,
@@ -660,7 +825,10 @@ def upcycle_dense_to_moe(
             enable_learnable_output_scale=enable_learnable_output_scale,
             output_scale_granularity=output_scale_granularity,
             initial_output_scale=float(initial_moe_output_scale if initial_moe_output_scale is not None else moe_output_scale),
+            moe_family=moe_family,
+            enable_output_norm_logging=enable_output_norm_logging,
         )
+        _align_sparse_moe_master_weights_fp32(moe_block, original_mlp)
         if init_method == "copy_noise":
             build_expert_from_mlp_state(
                 moe_block=moe_block,
@@ -735,6 +903,8 @@ def upcycle_dense_to_moe(
             # Random initialization matching ternary distribution expectations
             # Target: ~37% zeros, ~31.5% +1, ~31.5% -1 per expert
             _init_experts_random_ternary_matched(moe_block, noise_alpha)
+        elif init_method == "random_4bit_partition":
+            _init_experts_random_4bit_partition(moe_block, noise_alpha)
         else:
             raise ValueError(f"Unsupported moe init method `{init_method}`.")
 
@@ -769,9 +939,27 @@ def upcycle_dense_to_moe(
 
         block.mlp = moe_block
         block.use_moe = True
+        if moe_family == "partition_4bit_random" and parameter_budget_payload is None:
+            expert_params_per_layer = sum(count_module_parameters(expert) for expert in moe_block.experts)
+            router_params_per_layer = count_module_parameters(moe_block.router)
+            moe_block_params_per_layer = count_module_parameters(moe_block)
+            parameter_budget_payload = build_partition_4bit_parameter_budget_payload(
+                model,
+                dense_width_budget=intermediate_size,
+                dense_ffn_params_per_layer=count_module_parameters(original_mlp),
+                num_experts=num_experts,
+                top_k=num_experts_per_tok,
+                expert_intermediate_size=expert_intermediate_size,
+                expert_weight_bits=expert_weight_bits,
+                moe_family=moe_family,
+                moe_block_params_per_layer=moe_block_params_per_layer,
+                router_params_per_layer=router_params_per_layer,
+                expert_params_per_layer=expert_params_per_layer,
+            )
 
     model.config.use_moe = True
     model.config.moe_arch = moe_arch
+    model.config.moe_family = moe_family
     model.config.moe_num_experts = num_experts
     model.config.moe_num_experts_per_tok = int(sparse_top_k if moe_arch == "shared_residual" and enable_sparse_residual else num_experts_per_tok)
     model.config.moe_layer_indices = list(moe_layer_indices)
@@ -781,6 +969,7 @@ def upcycle_dense_to_moe(
     model.config.moe_normalize_topk_prob = normalize_topk_prob
     model.config.moe_output_router_logits = True
     model.config.moe_use_quantized_experts = use_quantized_experts
+    model.config.moe_expert_weight_bits = int(expert_weight_bits)
     model.config.moe_upcycling_noise_scale = noise_scale
     model.config.moe_noise_alpha = noise_alpha
     model.config.moe_noise_mode = noise_mode
@@ -820,6 +1009,7 @@ def upcycle_dense_to_moe(
     model.config.moe_auto_resolve_shared_width = bool(auto_resolve_shared_width)
     model.config.moe_skip_param_budget_resolver = bool(skip_param_budget_resolver)
     model.config.moe_parameter_budget_verification = parameter_budget_payload
+    model.config.moe_enable_output_norm_logging = bool(enable_output_norm_logging)
     model.config.moe_shared_residual_init_stats = shared_residual_init_stats
     if expert_group_assignments is not None:
         model.config.moe_expert_group_assignments = expert_group_assignments
@@ -827,4 +1017,11 @@ def upcycle_dense_to_moe(
         model.config.moe_expert_copy_group_assignments = expert_copy_group_assignments
     if complement_pairs is not None:
         model.config.moe_complement_pairs = [list(pair) for pair in complement_pairs]
+    if parameter_budget_payload is not None and moe_family == "partition_4bit_random":
+        actual_new_total_params = compute_baseline_param_count(model)
+        parameter_budget_payload["baseline_total_params"] = int(baseline_total_params)
+        parameter_budget_payload["target_total_params"] = int(baseline_total_params)
+        parameter_budget_payload["new_total_params"] = int(actual_new_total_params)
+        parameter_budget_payload["delta_params"] = int(actual_new_total_params - baseline_total_params)
+        parameter_budget_payload["delta_percent"] = float((actual_new_total_params - baseline_total_params) / max(baseline_total_params, 1))
     return model

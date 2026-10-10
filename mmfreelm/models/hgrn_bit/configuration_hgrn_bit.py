@@ -37,6 +37,9 @@ class HGRNBitConfig(PretrainedConfig):
         moe_normalize_topk_prob: bool = True,
         moe_output_router_logits: bool = False,
         moe_use_quantized_experts: bool = False,
+        moe_family: str = "standard",
+        moe_expert_weight_bits: int = 2,
+        moe_enable_output_norm_logging: bool = False,
         moe_layer_indices: Optional[list] = None,
         moe_upcycling_noise_scale: float = 0.05,
         moe_noise_alpha: Optional[float] = None,
@@ -105,6 +108,9 @@ class HGRNBitConfig(PretrainedConfig):
         self.moe_normalize_topk_prob = moe_normalize_topk_prob
         self.moe_output_router_logits = moe_output_router_logits
         self.moe_use_quantized_experts = moe_use_quantized_experts
+        self.moe_family = moe_family
+        self.moe_expert_weight_bits = moe_expert_weight_bits
+        self.moe_enable_output_norm_logging = moe_enable_output_norm_logging
         self.moe_layer_indices = [] if moe_layer_indices is None else list(moe_layer_indices)
         self.moe_upcycling_noise_scale = moe_upcycling_noise_scale
         self.moe_noise_alpha = moe_noise_alpha

@@ -1,0 +1,50 @@
+{
+  "experiment_name": "dense370_random_ffn_only_40k_tensorboard",
+  "description": "Dense 370M baseline with all FFN modules randomly reinitialized, only FFN parameters trainable, 40k training on relaxed-balanced 30B with TensorBoard.",
+  "dense_baseline": true,
+  "seed": 42,
+  "monitor_interval": 100,
+  "moe": {
+    "layer_indices": []
+  },
+  "dense_reinit": {
+    "enabled": true,
+    "scope": "all_ffn",
+    "strategy": "model_default",
+    "layer_indices": "all"
+  },
+  "freeze": {
+    "freeze_mode": "moe_only",
+    "freeze_embeddings": true,
+    "freeze_lm_head": true,
+    "freeze_token_mixer": true,
+    "freeze_non_moe_mlp": true,
+    "freeze_rmsnorm": true,
+    "strict_trainable_check": false,
+    "trainable_extra_patterns": [
+      ".mlp."
+    ]
+  },
+  "training": {
+    "precision": "bf16",
+    "device": "cuda",
+    "batch_size": 2,
+    "gradient_accumulation_steps": 16,
+    "max_steps": 40000,
+    "max_length": 2048,
+    "learning_rate": 0.0003,
+    "backbone_lr": 0.0003,
+    "norm_lr": 0.0003,
+    "weight_decay": 0.01,
+    "warmup_steps": 2000,
+    "grad_clip": 1.0,
+    "text_field": "text",
+    "log_interval": 25,
+    "eval_interval": 1000,
+    "save_interval": 1000,
+    "max_eval_batches": 64,
+    "max_val_samples": 1024,
+    "enable_tensorboard": true,
+    "tensorboard_subdir": "tensorboard"
+  }
+}

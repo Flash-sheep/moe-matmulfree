@@ -127,6 +127,7 @@ class HGRNBitBlock(nn.Module):
                     num_experts=config.moe_num_experts,
                     top_k=config.moe_num_experts_per_tok,
                     quantized_experts=config.moe_use_quantized_experts,
+                    expert_weight_bits=getattr(config, "moe_expert_weight_bits", 2),
                     expert_intermediate_factor=getattr(config, "moe_expert_intermediate_factor", 1.0),
                     expert_intermediate_size=getattr(config, "moe_expert_intermediate_size", None),
                     router_bias=config.moe_router_bias,
@@ -145,6 +146,8 @@ class HGRNBitBlock(nn.Module):
                     enable_learnable_output_scale=getattr(config, "moe_enable_learnable_output_scale", False),
                     output_scale_granularity=getattr(config, "moe_output_scale_granularity", "global"),
                     initial_output_scale=getattr(config, "moe_initial_output_scale", getattr(config, "moe_output_scale", 1.0)),
+                    moe_family=getattr(config, "moe_family", "standard"),
+                    enable_output_norm_logging=getattr(config, "moe_enable_output_norm_logging", False),
                 )
                 expert_group_assignments = getattr(config, "moe_expert_group_assignments", None)
                 if expert_group_assignments and getattr(self.mlp, "router", None) is not None:

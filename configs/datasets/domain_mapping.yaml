@@ -1,0 +1,22 @@
+slimpajama:
+  RedPajamaCommonCrawl: commoncrawl
+  RedPajamaC4: c4
+  RedPajamaGithub: code
+  RedPajamaWikipedia: wiki
+  RedPajamaBook: book
+  RedPajamaArXiv: academic
+  RedPajamaStackExchange: qa_forum
+  default: unknown
+
+fineweb_edu:
+  default: edu_web
+
+slimpajama_62b_venketh:
+  RedPajamaCommonCrawl: commoncrawl
+  RedPajamaC4: c4
+  RedPajamaGithub: code
+  RedPajamaWikipedia: wiki
+  RedPajamaBook: book
+  RedPajamaArXiv: academic
+  RedPajamaStackExchange: qa_forum
+  default: unknown

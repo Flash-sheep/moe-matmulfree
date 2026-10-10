@@ -1,0 +1,68 @@
+experiment:
+  name: dense_matmulfree_scratch_relaxed30b_stageA_ddp2
+  purpose: initialization_and_ddp_diagnostics
+
+model:
+  architecture: original_dense_matmulfree
+  moe_enabled: false
+  four_bit_enabled: false
+  from_scratch: true
+  pretrained_checkpoint: null
+  base_config_path: /home/storage/yjl/moe-matmulfree/checkpoints/MMfreeLM-370M
+  train_all_parameters: true
+  initialization_seed: 20260721
+
+data:
+  source: existing_relaxed_30b
+  path: /home/storage/yjl/matmulfreellm_assets/datasets/slimpajama_62b_venketh_relaxed_balanced_30b
+  train_split: train
+  validation_path: /home/storage/yjl/matmulfreellm_assets/datasets/slimpajama_62b_venketh_relaxed_balanced_30b/validation_domain_balanced
+  validation_split: validation
+  validation_note: domain_balanced_same_source
+  dataset_manifest: /home/storage/yjl/matmulfreellm_assets/datasets/slimpajama_62b_venketh_relaxed_balanced_30b/dataset_manifest.json
+  validation_manifest: /home/storage/yjl/matmulfreellm_assets/datasets/slimpajama_62b_venketh_relaxed_balanced_30b/validation_domain_balanced/dataset_manifest.json
+  tokenizer: /home/storage/yjl/moe-matmulfree/checkpoints/MMfreeLM-370M
+  sequence_length: 2048
+  text_field: text
+  reuse_existing_dataset: true
+  rebuild_dataset: false
+  packing: online_streaming_sliding_window
+
+distributed:
+  world_size: 2
+  backend: nccl
+  devices: [0, 1]
+
+training:
+  micro_batch_size_per_rank: 2
+  gradient_accumulation_steps: 16
+  precision: bf16
+  learning_rate: 0.001
+  min_lr: 0.0001
+  weight_decay: 0.01
+  warmup_steps: 500
+  grad_clip: 1.0
+  scheduler: cosine
+  scheduler_total_steps: 50000
+  max_eval_batches: 64
+  proxy_max_val_samples: 1024
+  log_interval: 10
+  eval_interval: 100
+  save_interval: 200
+  target_stage_a_tokens: 100000000
+  stop_after_stage_a: true
+  short_test_optimizer_steps: 32
+  ddp_equivalence_optimizer_steps: 1
+  ddp_equivalence_grad_accum_steps: 4
+  ddp_equivalence_per_rank_batch_size: 2
+
+diagnostics:
+  sharding_check_batches: 100
+  sharding_check_batch_size: 2
+  distributed_eval_reference_batches: 16
+  checkpoint_resume_test_steps: 24
+  checkpoint_resume_save_step: 12
+  activation_snapshot_token_milestones: [1000000, 10000000, 50000000, 100000000]
+
+output:
+  root_dir: /home/storage/yjl/moe-matmulfree/outputs
